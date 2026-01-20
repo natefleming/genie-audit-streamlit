@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=https://json.schemastore.org/databricks-asset-bundles.json
+# Databricks Asset Bundle configuration for Genie Audit Streamlit
+
+bundle:
+  name: genie-audit-streamlit
+
+sync:
+  include:
+    - app.py
+    - app.yaml
+    - requirements.txt
+    - pyproject.toml
+    - uv.lock
+    - README.md
+    - services/**
+    - components/**
+    - queries/**
+    - utils/**
+    - .streamlit/**
+  exclude:
+    - __pycache__/**
+    - "*.pyc"
+    - .git/**
+    - .databricks/**
+    - .venv/**
+    - venv/**
+    - tests/**
+    - pytest.ini
+    - htmlcov/**
+    - .pytest_cache/**
+
+targets:
+  default:
+    workspace:
+      root_path: "/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}"
+
+resources:
+  apps:
+    genie-audit:
+      name: genie-audit
+      description: Streamlit app for analyzing Genie query performance and identifying problematic queries
+      source_code_path: .
+      # Enable on-behalf-of-user authentication
+      user_api_scopes:
+        - sql
+        - dashboards.genie
+        - catalog.catalogs:read
+        - catalog.schemas:read
+        - catalog.tables:read
+      permissions:
+        - level: CAN_USE
+          group_name: users

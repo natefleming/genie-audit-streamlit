@@ -1,0 +1,7 @@
+# Install using uv from pyproject.toml
+# Run: uv pip install -e .
+#
+# Or install uv first, then sync:
+#   curl -LsSf https://astral.sh/uv/install.sh | sh
+#   uv sync
+uv

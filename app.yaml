@@ -1,0 +1,19 @@
+# Genie Performance Audit - Databricks App Configuration
+# Streamlit application for analyzing Genie query performance
+
+command:
+  - uv
+  - run
+  - streamlit
+  - run
+  - app.py
+  - "--server.port=8000"
+  - "--server.headless=true"
+  - "--server.enableCORS=false"
+  - "--server.enableXsrfProtection=false"
+
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: 148ccb90800933a1
+  - name: STREAMLIT_THEME_BASE
+    value: dark
