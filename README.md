@@ -1,35 +1,122 @@
 # Genie Performance Audit
 
-A Streamlit application for analyzing Databricks Genie query performance, identifying problematic queries, and providing optimization recommendations.
+A Streamlit application for analyzing Databricks Genie query performance, identifying bottlenecks, and providing actionable optimization recommendations.
+
+## Purpose
+
+This application helps data teams understand and optimize the performance of their Databricks Genie AI assistant. By analyzing query execution patterns, response times, and bottlenecks, teams can:
+
+- **Identify slow queries** impacting user experience
+- **Understand AI overhead** vs SQL execution time
+- **Pinpoint infrastructure bottlenecks** (warehouse sizing, queue wait, compute startup)
+- **Track usage patterns** across Genie rooms and users
+- **Generate actionable reports** for engineering teams
+
+## Screenshots
+
+### Genie Room Metrics
+![Genie Room Metrics](docs/images/genie-room-metrics.png)
+
+### Query Metrics
+![Query Metrics](docs/images/query-metrics.png)
+
+## Key Metrics
+
+### Room-Level Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Total Queries** | Number of queries executed in the Genie room |
+| **Avg Duration** | Average query execution time |
+| **P50/P90/P95/P99** | Latency percentiles for understanding tail latency |
+| **Slow Queries** | Count of queries exceeding 10 seconds |
+| **Success Rate** | Percentage of queries that completed successfully |
+| **Unique Users** | Number of distinct users querying the room |
+
+### Response Time Breakdown
+
+The application breaks down total response time into distinct phases:
+
+| Phase | Description |
+|-------|-------------|
+| **AI Processing** | Time from user message to SQL generation (Genie AI overhead) |
+| **Queue Wait** | Time waiting for warehouse capacity |
+| **Compute Startup** | Time for serverless compute to start |
+| **Compilation** | SQL parsing and query planning time |
+| **Execution** | Actual query execution time |
+
+### Bottleneck Classification
+
+Queries are automatically classified by their primary bottleneck:
+
+| Bottleneck | Criteria | Recommendation |
+|------------|----------|----------------|
+| **Compute Startup** | >50% of time in compute startup | Enable serverless warm pools or use provisioned compute |
+| **Queue Wait** | >30% of time waiting for capacity | Scale warehouse or optimize concurrency |
+| **Compilation** | >40% of time in compilation | Simplify complex queries, reduce joins |
+| **Large Scan** | >1GB data scanned | Add filters, use partitioning, create materialized views |
+| **Slow Execution** | >10s execution time | Optimize query, add indexes, review query plan |
+| **AI Processing** | High AI overhead | Expected for complex NL queries; monitor for anomalies |
+
+### Query-Level Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Statement ID** | Unique query identifier for debugging |
+| **API Request ID** | Genie API correlation ID |
+| **Conversation ID** | Genie conversation thread |
+| **User Question** | Original natural language prompt (when available) |
+| **SQL Query** | Generated SQL statement |
+| **Rows Scanned** | Number of rows processed |
+| **Data Read** | Amount of data scanned (MB/GB) |
+| **Genie Concurrency** | Concurrent Genie queries at submission time |
+| **Warehouse Concurrency** | Concurrent warehouse queries at submission time |
 
 ## Features
 
-- **Genie Room Overview**: Browse all Genie rooms with tile-based navigation showing query counts, average duration, and health indicators
-- **Room Insights**: Detailed performance analysis including:
-  - Key metrics (total queries, avg duration, slow queries, success rate)
-  - Daily trend charts (volume, slow queries, P90 latency)
-  - Duration distribution histogram
-  - Bottleneck type analysis
-  - Time breakdown by query phase
-  - Hourly query volume patterns
-  - Interactive query table with drill-down
-- **Query Detail**: Deep-dive into individual queries with:
-  - Execution timeline visualization
-  - Full SQL text with copy functionality
-  - Performance metrics (rows scanned, data read, selectivity)
-  - Automated optimization recommendations
+### Room Selection
+- Browse all Genie rooms in your workspace
+- Rooms owned by current user are highlighted
+- Search by room name or space ID
+
+### Performance Analysis
+- **Daily Query Volume**: Track query patterns over time
+- **Duration Distribution**: Histogram of query execution times
+- **Response Time Breakdown**: Stacked bar chart showing time spent in each phase
+- **AI Conversation Activity**: Message volume by type (new, follow-up, regenerate)
+
+### Query Investigation
+- Interactive query table sorted by duration
+- Click any row to see detailed breakdown
+- View original user question and generated SQL
+- Diagnostic SQL queries for follow-up investigation
+
+### Exportable Reports
+- **Room Report**: PDF with aggregate metrics, charts, and top slow queries
+- **Query Report**: PDF with detailed timing breakdown and recommendations
+
+## Data Sources
+
+The application queries these Databricks system tables:
+
+| Table | Purpose |
+|-------|---------|
+| `system.query.history` | SQL execution metrics, timing, and metadata |
+| `system.access.audit` | Genie API events for AI overhead calculation |
 
 ## Prerequisites
 
 - Python 3.10+
-- Databricks workspace with access to `system.query.history`
+- Databricks workspace with:
+  - Access to `system.query.history` and `system.access.audit`
+  - At least one Genie room with query activity
 - Databricks CLI configured (for deployment)
 
 ## Local Development
 
 1. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
 
 2. Set environment variables:
@@ -41,22 +128,22 @@ A Streamlit application for analyzing Databricks Genie query performance, identi
 
 3. Run locally:
    ```bash
-   streamlit run app.py
+   uv run streamlit run app.py
    ```
 
 ## Deployment to Databricks Apps
 
-Deploy using Databricks Asset Bundles:
+Deploy using the included script:
 
 ```bash
-# Validate the bundle
+./deploy.sh
+```
+
+Or manually with Databricks Asset Bundles:
+
+```bash
 databricks bundle validate
-
-# Deploy to Databricks
 databricks bundle deploy
-
-# Run the app
-databricks bundle run genie-audit
 ```
 
 ## Project Structure
@@ -66,51 +153,35 @@ genie-audit-streamlit/
 ├── app.py                     # Main Streamlit application
 ├── app.yaml                   # Databricks Apps configuration
 ├── databricks.yml             # Databricks Asset Bundle config
-├── requirements.txt           # Python dependencies
-├── .streamlit/
-│   └── config.toml            # Streamlit configuration
-├── pages/
-│   ├── 1_Room_Insights.py     # Room-specific analysis page
-│   └── 2_Query_Detail.py      # Individual query detail page
+├── pyproject.toml             # Python dependencies (uv)
 ├── services/
-│   ├── databricks_client.py   # WorkspaceClient wrapper
-│   └── analytics.py           # Query analysis and recommendations
+│   ├── databricks_client.py   # WorkspaceClient wrapper & Genie API
+│   ├── analytics.py           # Bottleneck classification & recommendations
+│   └── report_generator.py    # PDF report generation
 ├── components/
 │   ├── charts.py              # Plotly chart components
 │   ├── metrics.py             # Metric card components
 │   └── tiles.py               # Room tile grid component
 ├── queries/
-│   └── sql.py                 # Consolidated SQL queries
-└── utils/
-    └── formatters.py          # Duration, number formatting utilities
+│   └── sql.py                 # SQL queries for system tables
+├── utils/
+│   └── formatters.py          # Duration, number formatting utilities
+├── tests/                     # Unit and integration tests
+└── docs/
+    └── images/                # Screenshots and documentation images
 ```
-
-## SQL Queries
-
-All queries are consolidated from:
-- `genie_audit_bundle/src/dashboards/genie_performance.lvdash.json`
-- `genie_audit_bundle/tests/test_queries.sql`
-- `genie_performance_audit.sql`
-
-Queries analyze:
-- Query performance metrics (duration, P50/P90/P95/P99)
-- Bottleneck classification (compute startup, queue wait, compilation, large scan, slow execution)
-- Time breakdown by phase
-- Success/failure rates
-- User activity patterns
 
 ## Configuration
 
 ### app.yaml
-Controls Databricks Apps runtime configuration:
+Controls Databricks Apps runtime:
 - Streamlit server settings
 - Warehouse ID for SQL execution
 
 ### databricks.yml
 Controls deployment:
 - Bundle name and sync paths
-- User API scopes for authentication
-- App permissions
+- App permissions and user scopes
 
 ## License
 
