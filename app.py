@@ -18,7 +18,13 @@ st.set_page_config(
 )
 
 # Import services and components
-from services.databricks_client import get_client, DatabricksClient
+from services.databricks_client import (
+    get_client, 
+    DatabricksClient, 
+    ConversationWithMessages, 
+    MessageWithQueries, 
+    QueryMetrics,
+)
 from services.analytics import classify_bottleneck, get_query_optimizations, get_diagnostic_queries, map_status
 from services.report_generator import generate_pdf_report, generate_query_pdf_report
 from components.charts import (
@@ -948,6 +954,613 @@ def render_query_list(queries_df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+# ============================================================================
+# CONVERSATION TREE VIEW - Hierarchical view of Conversations → Messages → Queries
+# ============================================================================
+
+CONVERSATION_TREE_CSS = """
+<style>
+.conversation-card {
+    background: rgba(18,18,26,0.8);
+    border: 1px solid rgba(124,58,237,0.3);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 12px;
+}
+.conversation-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+.conversation-title {
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 600;
+}
+.conversation-meta {
+    color: #888888;
+    font-size: 12px;
+}
+.conversation-metrics {
+    display: flex;
+    gap: 16px;
+    margin-top: 8px;
+}
+.conv-metric {
+    text-align: center;
+}
+.conv-metric-value {
+    color: #06b6d4;
+    font-size: 16px;
+    font-weight: 600;
+}
+.conv-metric-label {
+    color: #888888;
+    font-size: 11px;
+}
+.message-card {
+    background: rgba(30,30,40,0.6);
+    border-left: 3px solid #7c3aed;
+    border-radius: 0 8px 8px 0;
+    padding: 12px 16px;
+    margin: 8px 0 8px 16px;
+}
+.message-prompt {
+    color: #ffffff;
+    font-size: 14px;
+    margin-bottom: 6px;
+}
+.message-meta {
+    color: #888888;
+    font-size: 11px;
+}
+.query-row {
+    background: rgba(40,40,50,0.5);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 6px 0 6px 32px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.query-row:hover {
+    background: rgba(50,50,60,0.7);
+}
+.query-preview {
+    color: #a3e635;
+    font-family: monospace;
+    font-size: 12px;
+    max-width: 400px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.query-metrics-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+.query-metric {
+    color: #888888;
+    font-size: 11px;
+}
+.query-metric-value {
+    color: #ffffff;
+    font-weight: 500;
+}
+.bottleneck-badge {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.bottleneck-normal { background: rgba(34,197,94,0.2); color: #22c55e; }
+.bottleneck-queue_wait { background: rgba(245,158,11,0.2); color: #f59e0b; }
+.bottleneck-compute_startup { background: rgba(239,68,68,0.2); color: #ef4444; }
+.bottleneck-compilation { background: rgba(168,85,247,0.2); color: #a855f7; }
+.bottleneck-slow_execution { background: rgba(239,68,68,0.2); color: #ef4444; }
+.bottleneck-large_scan { background: rgba(59,130,246,0.2); color: #3b82f6; }
+.speed-fast { color: #22c55e; }
+.speed-moderate { color: #f59e0b; }
+.speed-slow { color: #ef4444; }
+.speed-critical { color: #ef4444; font-weight: bold; }
+</style>
+"""
+
+
+def render_conversations_table(
+    conversations: list[ConversationWithMessages],
+) -> tuple[list[str], str, bool]:
+    """
+    Render a sortable table of conversations with key metrics and row selection.
+    
+    Columns:
+    - Conversation ID
+    - Conversation (title)
+    - Queries (count)
+    - Start Time
+    - Avg Response (seconds)
+    - Max Response (seconds)
+    - Issues (count of slow AI + slow queries)
+    
+    Includes search functionality to filter by conversation ID.
+    Returns tuple of (selected_ids, sort_by, ascending) for synchronizing with tree view.
+    """
+    if not conversations:
+        return [], "Start Time", False
+    
+    # Build DataFrame from conversations
+    data = []
+    for conv in conversations:
+        # Truncate long titles
+        title = conv.title if conv.title else f"Conversation {conv.conversation_id[:8]}..."
+        if len(title) > 50:
+            title = title[:50] + "..."
+        
+        # Parse and format start time (handle epoch timestamps)
+        start_time_display = ""
+        if conv.created_time:
+            try:
+                # Try to parse as numeric epoch (milliseconds or seconds)
+                ts_value = conv.created_time
+                if ts_value.isdigit() or (ts_value.replace(".", "", 1).isdigit()):
+                    ts_num = float(ts_value)
+                    # If > 1e12, it's in milliseconds; convert to seconds
+                    if ts_num > 1e12:
+                        ts_num = ts_num / 1000
+                    dt = pd.to_datetime(ts_num, unit="s")
+                else:
+                    # Try standard datetime parsing
+                    dt = pd.to_datetime(ts_value)
+                start_time_display = dt.strftime("%b %d, %Y %I:%M %p")
+            except Exception:
+                start_time_display = str(conv.created_time)[:16]
+        
+        # Count total issues
+        issue_count = conv.slow_ai_count + conv.slow_query_count
+        
+        data.append({
+            "Conversation ID": conv.conversation_id,
+            "Conversation": title,
+            "User": conv.user_email or "Unknown",
+            "Queries": conv.total_queries,
+            "Start Time": start_time_display,
+            "AI (s)": round(conv.total_ai_overhead_sec, 2),
+            "Avg (s)": round(conv.avg_response_sec, 2),
+            "Max (s)": round(conv.slowest_response_sec, 2),
+            "Issues": issue_count,
+            "Source": conv.conversation_source,
+        })
+    
+    df = pd.DataFrame(data)
+    
+    # Display section header
+    st.markdown("### Conversations Summary")
+    
+    # Search input for filtering by conversation ID
+    search_col1, search_col2 = st.columns([3, 1])
+    with search_col1:
+        search_query = st.text_input(
+            "Search by Conversation ID",
+            placeholder="Enter conversation ID to filter...",
+            key="conv_id_search",
+            label_visibility="collapsed"
+        )
+    with search_col2:
+        st.caption(f"{len(conversations)} conversations")
+    
+    # Filter DataFrame if search query provided
+    filtered_df = df
+    if search_query:
+        # Case-insensitive partial match on Conversation ID
+        mask = df["Conversation ID"].str.lower().str.contains(search_query.lower(), na=False)
+        filtered_df = df[mask]
+        if len(filtered_df) == 0:
+            st.warning(f"No conversations found matching '{search_query}'")
+        else:
+            st.caption(f"Showing {len(filtered_df)} of {len(df)} conversations matching '{search_query}'")
+    
+    # Sort controls
+    sort_col1, sort_col2 = st.columns([2, 1])
+    with sort_col1:
+        sort_options = ["Start Time", "AI (s)", "Avg (s)", "Max (s)", "Issues", "Queries"]
+        sort_by = st.selectbox(
+            "Sort by",
+            options=sort_options,
+            index=0,
+            key="conv_sort_by",
+            label_visibility="collapsed"
+        )
+    with sort_col2:
+        ascending = st.checkbox("Ascending", value=False, key="conv_sort_asc")
+    
+    # Apply sorting to filtered DataFrame
+    if sort_by and len(filtered_df) > 0:
+        filtered_df = filtered_df.sort_values(by=sort_by, ascending=ascending)
+    
+    st.caption("Select rows to filter the conversation details below")
+    
+    # Display sortable table with row selection enabled
+    event = st.dataframe(
+        filtered_df,
+        hide_index=True,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="multi-row",
+        key="conv_table_selection",
+        column_config={
+            "Conversation ID": st.column_config.TextColumn(
+                "Conversation ID",
+                width="medium",
+                help="Unique identifier for the conversation"
+            ),
+            "Conversation": st.column_config.TextColumn(
+                "Conversation",
+                width="large",
+                help="Conversation title or first message"
+            ),
+            "User": st.column_config.TextColumn(
+                "User",
+                width="medium",
+                help="User who started the conversation"
+            ),
+            "Queries": st.column_config.NumberColumn(
+                "Queries",
+                format="%d",
+                help="Number of SQL queries executed"
+            ),
+            "Start Time": st.column_config.TextColumn(
+                "Start Time",
+                width="medium",
+                help="When the conversation started"
+            ),
+            "AI (s)": st.column_config.NumberColumn(
+                "AI Overhead",
+                format="%.2f",
+                help="Total Genie AI model inference time in seconds"
+            ),
+            "Avg (s)": st.column_config.NumberColumn(
+                "Avg Response",
+                format="%.2f",
+                help="Average response time (AI + SQL) in seconds"
+            ),
+            "Max (s)": st.column_config.NumberColumn(
+                "Max Response",
+                format="%.2f",
+                help="Slowest response time in seconds"
+            ),
+            "Issues": st.column_config.NumberColumn(
+                "Issues",
+                format="%d",
+                help="Count of performance issues (slow AI > 10s, slow SQL > 10s)"
+            ),
+            "Source": st.column_config.TextColumn(
+                "Source",
+                width="small",
+                help="API or Space UI"
+            ),
+        },
+        height=min(400, 50 + len(filtered_df) * 35),  # Dynamic height based on filtered rows
+    )
+    
+    # Extract selected conversation IDs from the event
+    selected_ids: list[str] = []
+    if event and event.selection and event.selection.rows:
+        selected_rows = event.selection.rows
+        selected_ids = filtered_df.iloc[selected_rows]["Conversation ID"].tolist()
+        st.caption(f"{len(selected_ids)} conversation(s) selected")
+    
+    st.markdown("---")
+    
+    return selected_ids, sort_by, ascending
+
+
+def render_conversation_tree(
+    conversations: list[ConversationWithMessages],
+    selected_ids: list[str] | None = None,
+    room_name: str = "",
+    room_id: str = "",
+    sort_by: str = "Start Time",
+    sort_ascending: bool = False,
+    on_query_select: Optional[callable] = None,
+) -> Optional[str]:
+    """
+    Render an expandable tree view of conversations with messages and queries.
+    
+    Structure:
+    ▼ Conversation: "Show sales trends" (3 queries, avg 2.5s)
+      ├─ 💬 Message: "What were total sales?"
+      │   ├─ 🔍 Query 1: SELECT... (1.2s, Normal)
+      │   └─ 🔍 Query 2: SELECT... (3.1s, Large Scan)
+      └─ 💬 Message: "Break down by product"
+          └─ 🔍 Query 3: SELECT... (2.8s, Normal)
+    
+    Args:
+        conversations: List of ConversationWithMessages with full hierarchy
+        selected_ids: Optional list of conversation IDs to filter (show only these)
+        room_name: Genie room display name (for PDF reports)
+        room_id: Genie space ID (for PDF reports and profile URLs)
+        sort_by: Column to sort by (matches summary table options)
+        sort_ascending: Sort order (True=ascending, False=descending)
+        on_query_select: Optional callback when a query is selected
+        
+    Returns:
+        Selected statement_id if a query is clicked, None otherwise
+    """
+    st.markdown(CONVERSATION_TREE_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="section-header">💬 Conversations</div>', unsafe_allow_html=True)
+    
+    # Filter conversations if selected_ids is provided and non-empty
+    display_conversations = conversations
+    if selected_ids:
+        display_conversations = [c for c in conversations if c.conversation_id in selected_ids]
+        st.caption(f"Showing {len(display_conversations)} selected conversation(s)")
+    
+    if not display_conversations:
+        st.warning("""
+        **No conversations found for this Genie space.**
+        
+        Possible reasons:
+        - No one has started a conversation in this Genie space yet
+        - All conversations in this space have no messages with content
+        - The Genie API returned an empty response (check server logs for debug info)
+        
+        **Troubleshooting:**
+        1. Open the Genie space directly in Databricks and start a conversation
+        2. Ask a question that generates a SQL query
+        3. Click the 🔄 Refresh button above to reload data
+        """)
+        return None
+    
+    # Summary stats with source breakdown and performance issues
+    total_convs = len(display_conversations)
+    total_msgs = sum(len(c.messages) for c in display_conversations)
+    total_queries = sum(c.total_queries for c in display_conversations)
+    
+    # Performance issue counts
+    convs_with_issues = sum(1 for c in display_conversations if c.has_performance_issues)
+    total_slow_ai = sum(c.slow_ai_count for c in display_conversations)
+    total_slow_queries = sum(c.slow_query_count for c in display_conversations)
+    
+    # Count by source (API vs Space UI)
+    api_convs = sum(1 for c in display_conversations if c.conversation_source == "API")
+    space_convs = sum(1 for c in display_conversations if c.conversation_source == "Space")
+    unknown_convs = total_convs - api_convs - space_convs
+    
+    source_breakdown = []
+    if api_convs:
+        source_breakdown.append(f"🔌 {api_convs} API")
+    if space_convs:
+        source_breakdown.append(f"🖥️ {space_convs} Space")
+    if unknown_convs:
+        source_breakdown.append(f"❓ {unknown_convs} Unknown")
+    
+    source_str = " | ".join(source_breakdown) if source_breakdown else ""
+    
+    # Main summary
+    st.caption(f"{total_convs} conversations • {total_msgs} messages • {total_queries} SQL queries")
+    if source_str:
+        st.caption(f"Source: {source_str}")
+    
+    selected_statement_id = None
+    
+    # Sort conversations using the same order as the summary table
+    sort_key_map = {
+        "Start Time": lambda c: c.created_time or "",
+        "AI (s)": lambda c: c.total_ai_overhead_sec,
+        "Avg (s)": lambda c: c.avg_response_sec,
+        "Max (s)": lambda c: c.slowest_response_sec,
+        "Issues": lambda c: c.slow_ai_count + c.slow_query_count,
+        "Queries": lambda c: c.total_queries,
+    }
+    
+    sort_key = sort_key_map.get(sort_by, lambda c: c.created_time or "")
+    sorted_conversations = sorted(
+        display_conversations,
+        key=sort_key,
+        reverse=not sort_ascending
+    )
+    
+    # Render each conversation as an expander
+    for conv_idx, conv in enumerate(sorted_conversations):
+        # Build conversation header with metrics
+        conv_title = conv.title if conv.title else f"Conversation {conv.conversation_id[:8]}..."
+        if len(conv_title) > 60:
+            conv_title = conv_title[:60] + "..."
+        
+        avg_duration = conv.avg_duration_ms / 1000.0 if conv.avg_duration_ms else 0
+        slowest = conv.slowest_query_ms / 1000.0 if conv.slowest_query_ms else 0
+        
+        # Determine if conversation has issues using computed flags
+        has_failed = conv.success_rate < 100 if conv.success_rate else False
+        
+        icon = "⚠️" if conv.has_performance_issues or has_failed else "💬"
+        
+        # Show avg response time (AI + SQL combined) in expander
+        expander_label = f"{icon} {conv_title} ({conv.total_queries} queries, avg {conv.avg_response_sec:.1f}s response)"
+        
+        with st.expander(expander_label, expanded=False):
+            # Source indicator badge (API vs Space UI from audit logs)
+            source = conv.conversation_source
+            if source == "API":
+                source_badge = "🔌 API"
+                source_help = "Initiated via Genie API (genieStartConversationMessage or genieCreateConversationMessage)"
+            elif source == "Space":
+                source_badge = "🖥️ Space"
+                source_help = "Initiated via Genie Space UI (createConversationMessage)"
+            else:
+                source_badge = "❓ Unknown"
+                source_help = "Source could not be determined from audit logs"
+            
+            st.markdown(f"""
+            <div style="margin-bottom: 8px;">
+                <span style="background: {'#2563eb' if source == 'API' else '#7c3aed' if source == 'Space' else '#6b7280'}; 
+                            color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; 
+                            font-weight: 500;" title="{source_help}">
+                    {source_badge}
+                </span>
+                <span style="color: #888; font-size: 12px; margin-left: 8px;">
+                    Conversation ID: {conv.conversation_id[:12]}...
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Conversation metrics row with AI overhead
+            met_cols = st.columns(6)
+            with met_cols[0]:
+                st.metric("Queries", conv.total_queries)
+            with met_cols[1]:
+                st.metric("Avg Response", f"{conv.avg_response_sec:.1f}s")
+            with met_cols[2]:
+                st.metric("AI Overhead", f"{conv.total_ai_overhead_sec:.1f}s")
+            with met_cols[3]:
+                st.metric("Slowest", f"{conv.slowest_response_sec:.1f}s")
+            with met_cols[4]:
+                st.metric("Success Rate", f"{conv.success_rate:.0f}%")
+            with met_cols[5]:
+                # Show issue count if any
+                issue_count = conv.slow_ai_count + conv.slow_query_count
+                if issue_count > 0:
+                    st.metric("Issues", f"⚠️ {issue_count}")
+                else:
+                    st.metric("Issues", "✓ None")
+            
+            # Render each message
+            for msg_idx, msg in enumerate(conv.messages):
+                if not msg.content and not msg.queries:
+                    continue
+                
+                # Message container with AI overhead and performance indicators
+                msg_prompt = msg.content if msg.content else "(No prompt captured)"
+                if len(msg_prompt) > 150:
+                    msg_prompt = msg_prompt[:150] + "..."
+                
+                query_count_label = f"{msg.query_count} {'query' if msg.query_count == 1 else 'queries'}"
+                
+                # Build performance indicators
+                ai_label = f"AI: {msg.ai_overhead_sec:.1f}s"
+                ai_color = "#ef4444" if msg.has_slow_ai else "#10b981"
+                ai_icon = "⚠️" if msg.has_slow_ai else "✓"
+                
+                sql_duration = msg.total_duration_ms / 1000.0 if msg.total_duration_ms else 0
+                sql_color = "#ef4444" if msg.has_slow_query else "#10b981"
+                
+                total_response = f"Total: {msg.total_response_sec:.1f}s"
+                
+                st.markdown(f"""
+                <div class="message-card" style="border-left: 3px solid {'#ef4444' if msg.has_performance_issue else '#7c3aed'};">
+                    <div class="message-prompt">💬 {msg_prompt}</div>
+                    <div class="message-meta">
+                        {query_count_label} • 
+                        <span style="color: {ai_color};">{ai_icon} {ai_label}</span> • 
+                        <span style="color: {sql_color};">SQL: {sql_duration:.1f}s</span> • 
+                        <strong>{total_response}</strong>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Render queries for this message
+                for q_idx, query in enumerate(msg.queries):
+                    query_preview = query.query_text[:80] + "..." if len(query.query_text) > 80 else query.query_text
+                    query_preview = query_preview.replace("<", "&lt;").replace(">", "&gt;")
+                    
+                    duration_sec = query.total_duration_ms / 1000.0 if query.total_duration_ms else 0
+                    bottleneck_class = f"bottleneck-{query.bottleneck.lower()}"
+                    speed_class = f"speed-{query.speed_category.lower()}"
+                    
+                    # Create columns for query row: sql, duration, ai, compile, execute, queue, bottleneck, profile, pdf
+                    q_cols = st.columns([3.0, 0.8, 0.8, 0.8, 0.8, 0.8, 1, 0.5, 0.5])
+                    
+                    with q_cols[0]:
+                        st.code(query_preview, language="sql")
+                    
+                    with q_cols[1]:
+                        st.markdown(f"<span class='{speed_class}'>{duration_sec:.1f}s</span>", unsafe_allow_html=True)
+                    
+                    with q_cols[2]:
+                        st.caption(f"AI: {msg.ai_overhead_sec:.1f}s")
+                    
+                    with q_cols[3]:
+                        st.caption(f"Compile: {query.compilation_ms/1000:.1f}s")
+                    
+                    with q_cols[4]:
+                        st.caption(f"Execute: {query.execution_ms/1000:.1f}s")
+                    
+                    with q_cols[5]:
+                        st.caption(f"Queue: {query.queue_wait_ms/1000:.1f}s")
+                    
+                    with q_cols[6]:
+                        bottleneck_label = get_bottleneck_label(query.bottleneck)
+                        color = get_bottleneck_color(query.bottleneck)
+                        st.markdown(f"<span style='background:{color}20;color:{color};padding:2px 6px;border-radius:4px;font-size:10px;'>{bottleneck_label}</span>", unsafe_allow_html=True)
+                    
+                    with q_cols[7]:
+                        # Query profile link
+                        client = get_client()
+                        profile_url = client.get_query_profile_url(query.statement_id)
+                        if profile_url:
+                            st.link_button("🔗", profile_url, help="View query profile in Databricks")
+                    
+                    with q_cols[8]:
+                        # PDF download button
+                        query_dict = {
+                            "statement_id": query.statement_id,
+                            "query_text": query.query_text,
+                            "total_sec": query.total_duration_ms / 1000 if query.total_duration_ms else 0,
+                            "compile_sec": query.compilation_ms / 1000 if query.compilation_ms else 0,
+                            "execute_sec": query.execution_ms / 1000 if query.execution_ms else 0,
+                            "queue_sec": query.queue_wait_ms / 1000 if query.queue_wait_ms else 0,
+                            "wait_compute_sec": query.compute_wait_ms / 1000 if query.compute_wait_ms else 0,
+                            "read_rows": query.rows_scanned,
+                            "read_mb": query.bytes_scanned / 1024.0 / 1024.0 if query.bytes_scanned else 0,
+                            "bottleneck": query.bottleneck,
+                            "execution_status": query.execution_status,
+                            "genie_space_id": room_id,
+                            # Additional metrics for complete PDF
+                            "ai_overhead_sec": msg.ai_overhead_sec,
+                            "executed_by": query.executed_by,
+                            "start_time": query.start_time,
+                            "conversation_id": conv.conversation_id,
+                        }
+                        phase_df = build_query_phase_breakdown(query_dict)
+                        pdf_bytes = generate_query_pdf_report(
+                            query_dict, room_name, room_id, phase_df,
+                            user_prompt=msg.content if msg.content else None
+                        )
+                        st.download_button(
+                            "📄", 
+                            pdf_bytes,
+                            file_name=f"query_{query.statement_id[:8]}.pdf",
+                            mime="application/pdf",
+                            help="Download PDF report",
+                            key=f"pdf_{conv.conversation_id}_{msg.message_id}_{query.statement_id}"
+                        )
+    
+    # Check if selection was made via session state
+    if "selected_query_from_tree" in st.session_state:
+        selected_statement_id = st.session_state.get("selected_query_from_tree")
+    
+    return selected_statement_id
+
+
+def load_conversations_with_metrics(
+    client: DatabricksClient, 
+    space_id: str, 
+    max_conversations: int = 50
+) -> list[ConversationWithMessages]:
+    """Load conversations with their messages and query metrics."""
+    try:
+        return client.get_conversations_with_query_metrics(
+            space_id=space_id,
+            max_conversations=max_conversations,
+        )
+    except Exception as e:
+        print(f"Error loading conversations: {e}")
+        return []
+
+
 def render_query_detail(
     query_id: str, 
     queries_df: pd.DataFrame,
@@ -991,6 +1604,16 @@ def render_query_detail(
         </div>
     </div>
     """, unsafe_allow_html=True)
+    
+    # View Query Profile button - opens Databricks Query History UI
+    client = get_client()
+    profile_url = client.get_query_profile_url(statement_id)
+    if profile_url:
+        st.link_button(
+            "📊 View Query Profile in Databricks",
+            profile_url,
+            help="Open in Databricks to view full query profile and download execution plan as JSON",
+        )
     
     # Display the user's original question/prompt (pre-loaded during data fetch)
     user_prompt = query.get("user_prompt", "") or ""
@@ -1218,9 +1841,13 @@ def main() -> None:
                     queries_df["user_prompt"] = ""
                 progress_bar.progress(85)
                 
-                status_text.markdown("**Step 7/7:** Loading AI conversation activity from audit logs...")
+                status_text.markdown("**Step 7/8:** Loading AI conversation activity from audit logs...")
                 conversation_daily_df = load_conversation_daily(client, room_id, hours)
                 conversation_peak = load_conversation_peak(client, room_id, hours)
+                progress_bar.progress(90)
+                
+                status_text.markdown("**Step 8/8:** Loading conversation tree with SQL query lineage...")
+                conversations_with_metrics = load_conversations_with_metrics(client, room_id, max_conversations=50)
                 progress_bar.progress(100)
                 
                 status_text.markdown("✅ **Analysis complete!**")
@@ -1239,6 +1866,7 @@ def main() -> None:
                 "queries_df": queries_df,
                 "conversation_daily_df": conversation_daily_df,
                 "conversation_peak": conversation_peak,
+                "conversations_with_metrics": conversations_with_metrics,
             }
             
             # Reset force refresh flag
@@ -1253,6 +1881,7 @@ def main() -> None:
             queries_df = cached["queries_df"]
             conversation_daily_df = cached["conversation_daily_df"]
             conversation_peak = cached["conversation_peak"]
+            conversations_with_metrics = cached.get("conversations_with_metrics", [])
         
         # Generate room report PDF and update filter row with download button
         room_name = st.session_state.get("selected_room_name", room_id)
@@ -1321,10 +1950,32 @@ def main() -> None:
         
         st.markdown("---")
         
-        # Query list with selection
-        selected_query = render_query_list(queries_df)
+        # Conversation-centric view (primary) - shows conversations with messages and queries
+        st.markdown("""
+        <div style="background: rgba(124,58,237,0.1); border: 1px solid rgba(124,58,237,0.3); border-radius: 8px; padding: 12px; margin-bottom: 16px;">
+            <strong>💬 Conversation Performance Analysis</strong><br/>
+            <span style="color: #888; font-size: 13px;">
+                Analyze Genie interactions from conversation → prompt → SQL query. 
+                Identify slow AI responses and SQL execution bottlenecks.
+                Click the 📊 button next to any query to view detailed metrics.
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # If a query is selected, show its specific breakdown below
+        # Sortable summary table of all conversations (returns selected IDs and sort params)
+        selected_conv_ids, sort_by, sort_ascending = render_conversations_table(conversations_with_metrics)
+        
+        # Expandable conversation tree with details (filtered by selection, sorted same as table)
+        selected_query = render_conversation_tree(
+            conversations_with_metrics, 
+            selected_ids=selected_conv_ids,
+            room_name=room_name,
+            room_id=room_id,
+            sort_by=sort_by,
+            sort_ascending=sort_ascending,
+        )
+        
+        # If a query is selected (from either view), show its specific breakdown below
         if selected_query:
             query_row = queries_df[queries_df["statement_id"] == selected_query]
             if not query_row.empty:

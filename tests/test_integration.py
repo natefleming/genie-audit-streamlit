@@ -239,6 +239,70 @@ class TestErrorHandlingIntegration:
         assert result is None
 
 
+class TestConversationMetricsIntegration:
+    """Integration tests for conversation-centric metrics."""
+    
+    def test_message_ai_overhead_query(self, databricks_client, integration_space_id):
+        """Test the message AI overhead query syntax is valid."""
+        from queries.sql import get_message_ai_overhead_query
+        
+        sql = get_message_ai_overhead_query(integration_space_id, hours=24)
+        result = databricks_client.execute_sql(sql, use_cache=False)
+        
+        assert isinstance(result, pd.DataFrame)
+        
+        # Query should return these columns even if empty
+        if not result.empty:
+            assert "conversation_id" in result.columns
+            assert "message_id" in result.columns
+            assert "ai_overhead_sec" in result.columns
+            assert "message_source" in result.columns
+    
+    def test_conversation_sources_query(self, databricks_client, integration_space_id):
+        """Test the conversation sources query syntax is valid."""
+        from queries.sql import get_conversation_sources_query
+        
+        sql = get_conversation_sources_query(integration_space_id, hours=24)
+        result = databricks_client.execute_sql(sql, use_cache=False)
+        
+        assert isinstance(result, pd.DataFrame)
+        
+        if not result.empty:
+            assert "conversation_id" in result.columns
+            assert "message_source" in result.columns
+    
+    def test_queries_by_statement_ids(self, databricks_client):
+        """Test batch query for statement IDs."""
+        from queries.sql import QUERIES_BY_STATEMENT_IDS, build_statement_ids_filter
+        
+        # Use a fake statement ID - query should succeed but return empty
+        statement_ids_str = build_statement_ids_filter(["nonexistent-stmt-id"])
+        sql = QUERIES_BY_STATEMENT_IDS.format(statement_ids=statement_ids_str)
+        result = databricks_client.execute_sql(sql, use_cache=False)
+        
+        assert isinstance(result, pd.DataFrame)
+    
+    def test_get_conversations_with_query_metrics(self, databricks_client, integration_space_id):
+        """Test the full conversation data loading."""
+        from services.databricks_client import ConversationWithMessages
+        
+        result = databricks_client.get_conversations_with_query_metrics(
+            space_id=integration_space_id,
+            max_conversations=5
+        )
+        
+        assert isinstance(result, list)
+        
+        # If any conversations returned, verify structure
+        for conv in result:
+            assert isinstance(conv, ConversationWithMessages)
+            assert conv.conversation_id is not None
+            assert isinstance(conv.messages, list)
+            assert isinstance(conv.total_queries, int)
+            assert isinstance(conv.has_performance_issues, bool)
+            assert isinstance(conv.total_ai_overhead_sec, float)
+
+
 # Custom pytest marker for integration tests
 def pytest_configure(config):
     config.addinivalue_line(

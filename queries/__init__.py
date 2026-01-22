@@ -16,8 +16,16 @@ from .sql import (
     SPACE_METRICS_QUERY,
     AI_LATENCY_METRICS_QUERY,
     AI_LATENCY_TREND_QUERY,
+    QUERIES_BY_STATEMENT_IDS,
+    QUERIES_BY_SPACE_AND_TIME,
+    CONVERSATION_SOURCE_QUERY,
+    MESSAGE_AI_OVERHEAD_QUERY,
     build_audit_space_filter,
     build_query_space_filter,
+    build_statement_ids_filter,
+    get_conversation_sources_query,
+    get_message_ai_overhead_query,
+    get_queries_by_space_and_time,
 )
 
 __all__ = [
@@ -37,6 +45,14 @@ __all__ = [
     "SPACE_METRICS_QUERY",
     "AI_LATENCY_METRICS_QUERY",
     "AI_LATENCY_TREND_QUERY",
+    "QUERIES_BY_STATEMENT_IDS",
+    "QUERIES_BY_SPACE_AND_TIME",
+    "CONVERSATION_SOURCE_QUERY",
+    "MESSAGE_AI_OVERHEAD_QUERY",
     "build_audit_space_filter",
     "build_query_space_filter",
+    "build_statement_ids_filter",
+    "get_conversation_sources_query",
+    "get_message_ai_overhead_query",
+    "get_queries_by_space_and_time",
 ]

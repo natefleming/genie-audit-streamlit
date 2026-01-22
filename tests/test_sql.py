@@ -215,6 +215,11 @@ class TestQueriesListQuery:
     def test_has_ai_overhead_column(self):
         assert "ai_overhead_sec" in QUERIES_LIST_QUERY
     
+    def test_has_message_source_column(self):
+        assert "message_source" in QUERIES_LIST_QUERY
+        assert "'API'" in QUERIES_LIST_QUERY
+        assert "'Internal'" in QUERIES_LIST_QUERY
+    
     def test_classifies_bottleneck(self):
         assert "bottleneck" in QUERIES_LIST_QUERY
         assert "CASE" in QUERIES_LIST_QUERY

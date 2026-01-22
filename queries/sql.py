@@ -472,7 +472,12 @@ SELECT
   api_request_id,
   conversation_id,
   message_id,
-  ROUND(COALESCE(TIMESTAMPDIFF(SECOND, message_time, start_time), 0), 1) AS ai_overhead_sec
+  ROUND(COALESCE(TIMESTAMPDIFF(SECOND, message_time, start_time), 0), 1) AS ai_overhead_sec,
+  CASE 
+    WHEN message_action IN ('genieCreateConversationMessage', 'genieStartConversationMessage') THEN 'API'
+    WHEN message_action IN ('createConversationMessage', 'regenerateConversationMessage') THEN 'Internal'
+    ELSE 'Unknown'
+  END AS message_source
 FROM query_with_message
 WHERE rn = 1 OR rn IS NULL
 ORDER BY total_duration_ms DESC
@@ -849,3 +854,211 @@ def build_query_space_filter(space_id: str | None) -> str:
     if not space_id:
         return ""
     return f"AND query_source.genie_space_id = '{space_id}'"
+
+
+# ============================================================================
+# BATCH QUERY BY STATEMENT IDS - For conversation-first data fetching
+# ============================================================================
+
+QUERIES_BY_STATEMENT_IDS = """
+SELECT
+    statement_id,
+    query_source.genie_space_id AS genie_space_id,
+    compute.warehouse_id AS warehouse_id,
+    executed_by,
+    start_time,
+    end_time,
+    total_duration_ms,
+    COALESCE(compilation_duration_ms, 0) AS compilation_ms,
+    COALESCE(execution_duration_ms, 0) AS execution_ms,
+    COALESCE(waiting_at_capacity_duration_ms, 0) AS queue_wait_ms,
+    COALESCE(waiting_for_compute_duration_ms, 0) AS compute_wait_ms,
+    COALESCE(result_fetch_duration_ms, 0) AS result_fetch_ms,
+    COALESCE(read_bytes, 0) AS bytes_scanned,
+    COALESCE(read_rows, 0) AS rows_scanned,
+    COALESCE(produced_rows, 0) AS rows_returned,
+    execution_status,
+    LEFT(statement_text, 500) AS query_text,
+    CASE
+      WHEN COALESCE(waiting_for_compute_duration_ms, 0) > total_duration_ms * 0.5 THEN 'COMPUTE_STARTUP'
+      WHEN COALESCE(waiting_at_capacity_duration_ms, 0) > total_duration_ms * 0.3 THEN 'QUEUE_WAIT'
+      WHEN COALESCE(compilation_duration_ms, 0) > total_duration_ms * 0.4 THEN 'COMPILATION'
+      WHEN COALESCE(read_bytes, 0) > 1073741824 THEN 'LARGE_SCAN'
+      WHEN COALESCE(execution_duration_ms, 0) > 10000 THEN 'SLOW_EXECUTION'
+      ELSE 'NORMAL'
+    END AS bottleneck,
+    CASE
+      WHEN total_duration_ms >= 30000 THEN 'CRITICAL'
+      WHEN total_duration_ms >= 10000 THEN 'SLOW'
+      WHEN total_duration_ms >= 5000 THEN 'MODERATE'
+      ELSE 'FAST'
+    END AS speed_category
+FROM system.query.history
+WHERE statement_id IN ({statement_ids})
+"""
+
+
+def build_statement_ids_filter(statement_ids: list[str]) -> str:
+    """Build SQL IN clause for statement IDs."""
+    if not statement_ids:
+        return "''"
+    escaped_ids = [sid.replace("'", "''") for sid in statement_ids]
+    return ", ".join(f"'{sid}'" for sid in escaped_ids)
+
+
+# ============================================================================
+# QUERIES BY SPACE WITH TIMING - For time-based message correlation
+# ============================================================================
+
+QUERIES_BY_SPACE_AND_TIME = """
+SELECT
+    statement_id,
+    query_source.genie_space_id AS genie_space_id,
+    query_source.genie_conversation_id AS genie_conversation_id,
+    compute.warehouse_id AS warehouse_id,
+    executed_by,
+    start_time,
+    end_time,
+    total_duration_ms,
+    COALESCE(compilation_duration_ms, 0) AS compilation_ms,
+    COALESCE(execution_duration_ms, 0) AS execution_ms,
+    COALESCE(waiting_at_capacity_duration_ms, 0) AS queue_wait_ms,
+    COALESCE(waiting_for_compute_duration_ms, 0) AS compute_wait_ms,
+    COALESCE(result_fetch_duration_ms, 0) AS result_fetch_ms,
+    COALESCE(read_bytes, 0) AS bytes_scanned,
+    COALESCE(read_rows, 0) AS rows_scanned,
+    COALESCE(produced_rows, 0) AS rows_returned,
+    execution_status,
+    LEFT(statement_text, 500) AS query_text,
+    CASE
+      WHEN COALESCE(waiting_for_compute_duration_ms, 0) > total_duration_ms * 0.5 THEN 'COMPUTE_STARTUP'
+      WHEN COALESCE(waiting_at_capacity_duration_ms, 0) > total_duration_ms * 0.3 THEN 'QUEUE_WAIT'
+      WHEN COALESCE(compilation_duration_ms, 0) > total_duration_ms * 0.4 THEN 'COMPILATION'
+      WHEN COALESCE(read_bytes, 0) > 1073741824 THEN 'LARGE_SCAN'
+      WHEN COALESCE(execution_duration_ms, 0) > 10000 THEN 'SLOW_EXECUTION'
+      ELSE 'NORMAL'
+    END AS bottleneck,
+    CASE
+      WHEN total_duration_ms >= 30000 THEN 'CRITICAL'
+      WHEN total_duration_ms >= 10000 THEN 'SLOW'
+      WHEN total_duration_ms >= 5000 THEN 'MODERATE'
+      ELSE 'FAST'
+    END AS speed_category
+FROM system.query.history
+WHERE query_source.genie_space_id = '{space_id}'
+  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+ORDER BY start_time ASC
+"""
+
+
+def get_queries_by_space_and_time(space_id: str, hours: int = 720) -> str:
+    """Build query to fetch all queries for a space with timing info."""
+    return QUERIES_BY_SPACE_AND_TIME.format(space_id=space_id, hours=hours)
+
+
+# ============================================================================
+# CONVERSATION SOURCE LOOKUP - From audit logs (aibiGenie events)
+# ============================================================================
+
+CONVERSATION_SOURCE_QUERY = """
+SELECT
+    request_params.conversation_id AS conversation_id,
+    action_name,
+    event_time,
+    user_identity.email AS user_email,
+    CASE
+        WHEN action_name IN ('genieCreateConversationMessage', 'genieStartConversationMessage') THEN 'API'
+        WHEN action_name IN ('createConversationMessage', 'createConversation') THEN 'Space'
+        ELSE 'Unknown'
+    END AS message_source
+FROM system.access.audit
+WHERE service_name = 'aibiGenie'
+  AND action_name IN (
+      'genieStartConversationMessage',
+      'genieCreateConversationMessage', 
+      'createConversationMessage',
+      'createConversation'
+  )
+  AND request_params.space_id = '{space_id}'
+  AND event_date >= current_timestamp() - INTERVAL {hours} HOUR
+ORDER BY event_time ASC
+"""
+
+
+def get_conversation_sources_query(space_id: str, hours: int = 720) -> str:
+    """Build query to get conversation sources from audit logs."""
+    return CONVERSATION_SOURCE_QUERY.format(space_id=space_id, hours=hours)
+
+
+# ============================================================================
+# MESSAGE AI OVERHEAD - Time from message submission to first SQL query
+# ============================================================================
+
+MESSAGE_AI_OVERHEAD_QUERY = """
+WITH message_events AS (
+    SELECT 
+        request_params.conversation_id AS conversation_id,
+        request_params.message_id AS message_id,
+        event_time AS message_time,
+        request_params.space_id AS space_id,
+        user_identity.email AS user_email,
+        action_name,
+        CASE
+            WHEN action_name IN ('genieCreateConversationMessage', 'genieStartConversationMessage') THEN 'API'
+            WHEN action_name IN ('createConversationMessage', 'regenerateConversationMessage') THEN 'Space'
+            ELSE 'Unknown'
+        END AS message_source
+    FROM system.access.audit
+    WHERE service_name = 'aibiGenie'
+      AND action_name IN (
+          'genieStartConversationMessage',
+          'genieCreateConversationMessage', 
+          'createConversationMessage',
+          'regenerateConversationMessage'
+      )
+      AND request_params.space_id = '{space_id}'
+      AND event_date >= current_timestamp() - INTERVAL {hours} HOUR
+),
+queries AS (
+    SELECT 
+        statement_id,
+        query_source.genie_space_id AS space_id,
+        start_time AS query_start,
+        total_duration_ms,
+        executed_by
+    FROM system.query.history
+    WHERE query_source.genie_space_id = '{space_id}'
+      AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+),
+message_with_first_query AS (
+    SELECT 
+        m.conversation_id,
+        m.message_id,
+        m.message_time,
+        m.message_source,
+        m.user_email,
+        MIN(q.query_start) AS first_query_time,
+        MIN(q.statement_id) AS first_statement_id
+    FROM message_events m
+    LEFT JOIN queries q ON m.space_id = q.space_id
+        AND m.user_email = q.executed_by
+        AND q.query_start BETWEEN m.message_time AND m.message_time + INTERVAL 5 MINUTE
+    GROUP BY m.conversation_id, m.message_id, m.message_time, m.message_source, m.user_email
+)
+SELECT 
+    conversation_id,
+    message_id,
+    message_time,
+    message_source,
+    user_email,
+    first_query_time,
+    first_statement_id,
+    ROUND(COALESCE(TIMESTAMPDIFF(SECOND, message_time, first_query_time), 0), 1) AS ai_overhead_sec
+FROM message_with_first_query
+ORDER BY message_time ASC
+"""
+
+
+def get_message_ai_overhead_query(space_id: str, hours: int = 720) -> str:
+    """Build query to get AI overhead per message from audit logs."""
+    return MESSAGE_AI_OVERHEAD_QUERY.format(space_id=space_id, hours=hours)

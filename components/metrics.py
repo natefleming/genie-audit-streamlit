@@ -192,3 +192,243 @@ def render_status_badge(status: str) -> str:
     display_text = status.lower().replace("finished", "success").replace("canceled", "cancelled")
     
     return render_badge(display_text.title(), color)
+
+
+# ============================================================================
+# CONVERSATION-LEVEL METRICS
+# ============================================================================
+
+CONVERSATION_METRICS_CSS = """
+<style>
+.conv-metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+}
+.conv-metric-box {
+    background: rgba(18,18,26,0.6);
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+}
+.conv-metric-value {
+    color: #06b6d4;
+    font-size: 20px;
+    font-weight: 600;
+    font-family: monospace;
+}
+.conv-metric-label {
+    color: #888888;
+    font-size: 11px;
+    margin-top: 4px;
+}
+.msg-metrics-inline {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    color: #888888;
+    font-size: 12px;
+}
+.msg-metric-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.msg-metric-value {
+    color: #ffffff;
+    font-weight: 500;
+}
+</style>
+"""
+
+
+def render_conversation_metrics(
+    total_queries: int,
+    avg_duration_ms: float,
+    slowest_query_ms: int,
+    success_rate: float,
+    created_time: str = "",
+) -> None:
+    """
+    Render aggregated metrics for a conversation.
+    
+    Args:
+        total_queries: Total number of SQL queries in this conversation
+        avg_duration_ms: Average query duration in milliseconds
+        slowest_query_ms: Slowest query duration in milliseconds
+        success_rate: Success rate as percentage (0-100)
+        created_time: Optional creation timestamp
+    """
+    st.markdown(CONVERSATION_METRICS_CSS, unsafe_allow_html=True)
+    
+    avg_sec = avg_duration_ms / 1000.0 if avg_duration_ms else 0
+    slowest_sec = slowest_query_ms / 1000.0 if slowest_query_ms else 0
+    
+    metrics_html = f"""
+    <div class="conv-metrics-grid">
+        <div class="conv-metric-box">
+            <div class="conv-metric-value">{total_queries}</div>
+            <div class="conv-metric-label">Queries</div>
+        </div>
+        <div class="conv-metric-box">
+            <div class="conv-metric-value">{avg_sec:.1f}s</div>
+            <div class="conv-metric-label">Avg Duration</div>
+        </div>
+        <div class="conv-metric-box">
+            <div class="conv-metric-value">{slowest_sec:.1f}s</div>
+            <div class="conv-metric-label">Slowest</div>
+        </div>
+        <div class="conv-metric-box">
+            <div class="conv-metric-value">{success_rate:.0f}%</div>
+            <div class="conv-metric-label">Success Rate</div>
+        </div>
+    </div>
+    """
+    
+    st.markdown(metrics_html, unsafe_allow_html=True)
+
+
+def render_message_metrics_inline(
+    query_count: int,
+    total_duration_ms: int,
+) -> str:
+    """
+    Generate inline HTML for message-level metrics.
+    
+    Args:
+        query_count: Number of queries for this message
+        total_duration_ms: Total duration of all queries in milliseconds
+        
+    Returns:
+        HTML string for inline metrics display
+    """
+    total_sec = total_duration_ms / 1000.0 if total_duration_ms else 0
+    query_label = "query" if query_count == 1 else "queries"
+    
+    return f"""
+    <div class="msg-metrics-inline">
+        <div class="msg-metric-item">
+            🔍 <span class="msg-metric-value">{query_count}</span> {query_label}
+        </div>
+        <div class="msg-metric-item">
+            ⏱️ <span class="msg-metric-value">{total_sec:.1f}s</span> total
+        </div>
+    </div>
+    """
+
+
+def render_query_metrics_row(
+    duration_ms: int,
+    compilation_ms: int,
+    execution_ms: int,
+    queue_wait_ms: int,
+    bottleneck: str,
+    speed_category: str,
+) -> str:
+    """
+    Generate HTML for a compact query metrics row.
+    
+    Args:
+        duration_ms: Total query duration
+        compilation_ms: Compilation time
+        execution_ms: Execution time
+        queue_wait_ms: Queue wait time
+        bottleneck: Bottleneck type
+        speed_category: Speed category (FAST, MODERATE, SLOW, CRITICAL)
+        
+    Returns:
+        HTML string for the metrics row
+    """
+    duration_sec = duration_ms / 1000.0 if duration_ms else 0
+    compile_sec = compilation_ms / 1000.0 if compilation_ms else 0
+    exec_sec = execution_ms / 1000.0 if execution_ms else 0
+    queue_sec = queue_wait_ms / 1000.0 if queue_wait_ms else 0
+    
+    # Speed category colors
+    speed_colors = {
+        "FAST": "#22c55e",
+        "MODERATE": "#f59e0b",
+        "SLOW": "#ef4444",
+        "CRITICAL": "#ef4444",
+    }
+    speed_color = speed_colors.get(speed_category.upper(), "#888888")
+    
+    # Bottleneck colors
+    bottleneck_colors = {
+        "NORMAL": "#22c55e",
+        "QUEUE_WAIT": "#f59e0b",
+        "COMPUTE_STARTUP": "#ef4444",
+        "COMPILATION": "#a855f7",
+        "SLOW_EXECUTION": "#ef4444",
+        "LARGE_SCAN": "#3b82f6",
+    }
+    bottleneck_color = bottleneck_colors.get(bottleneck.upper(), "#888888")
+    bottleneck_display = bottleneck.replace("_", " ").title()
+    
+    return f"""
+    <div style="display:flex;gap:16px;align-items:center;font-size:12px;">
+        <span style="color:{speed_color};font-weight:600;">{duration_sec:.1f}s</span>
+        <span style="color:#888;">Compile: {compile_sec:.1f}s</span>
+        <span style="color:#888;">Execute: {exec_sec:.1f}s</span>
+        <span style="color:#888;">Queue: {queue_sec:.1f}s</span>
+        <span style="background:{bottleneck_color}20;color:{bottleneck_color};padding:2px 8px;border-radius:4px;font-size:10px;">{bottleneck_display}</span>
+    </div>
+    """
+
+
+def render_conversations_summary_metrics(
+    total_conversations: int,
+    total_messages: int,
+    total_queries: int,
+    avg_queries_per_conversation: float,
+    overall_avg_duration_ms: float,
+    overall_success_rate: float,
+) -> None:
+    """
+    Render summary metrics for all conversations in a space.
+    
+    Args:
+        total_conversations: Total number of conversations
+        total_messages: Total number of messages across conversations
+        total_queries: Total number of SQL queries
+        avg_queries_per_conversation: Average queries per conversation
+        overall_avg_duration_ms: Average query duration across all conversations
+        overall_success_rate: Overall success rate percentage
+    """
+    avg_sec = overall_avg_duration_ms / 1000.0 if overall_avg_duration_ms else 0
+    
+    metrics = [
+        {
+            "title": "Conversations",
+            "value": str(total_conversations),
+            "icon": "💬",
+            "color": "violet",
+        },
+        {
+            "title": "Messages",
+            "value": str(total_messages),
+            "icon": "📝",
+            "color": "cyan",
+        },
+        {
+            "title": "SQL Queries",
+            "value": str(total_queries),
+            "icon": "🔍",
+            "color": "green",
+        },
+        {
+            "title": "Avg Queries/Conv",
+            "value": f"{avg_queries_per_conversation:.1f}",
+            "icon": "📊",
+            "color": "orange",
+        },
+        {
+            "title": "Avg Duration",
+            "value": f"{avg_sec:.1f}s",
+            "icon": "⏱️",
+            "color": "cyan",
+        },
+    ]
+    
+    render_metrics_row(metrics)
