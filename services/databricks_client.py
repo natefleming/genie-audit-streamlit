@@ -83,6 +83,9 @@ class QueryMetrics:
     # Fields for correlation matching
     genie_conversation_id: str = ""  # From query_source.genie_conversation_id
     executed_by: str = ""  # User email who executed the query
+    # Concurrency metrics at query start time
+    genie_concurrent: int = 0  # Concurrent Genie queries at start time
+    warehouse_concurrent: int = 0  # Concurrent warehouse queries at start time
 
 
 @dataclass
@@ -1174,6 +1177,18 @@ class DatabricksClient:
                 import traceback
                 traceback.print_exc()
             
+            # Step 1e: Get warehouse_id from the Genie space for concurrency calculation
+            space_warehouse_id = ""
+            try:
+                space_info = self.get_genie_space(space_id)
+                if space_info and space_info.warehouse_id:
+                    space_warehouse_id = space_info.warehouse_id
+                    print(f"[DEBUG] Got warehouse_id from Genie space: {space_warehouse_id}")
+                else:
+                    print(f"[DEBUG] Could not get warehouse_id from Genie space")
+            except Exception as e:
+                print(f"[DEBUG] Error getting Genie space info: {e}")
+            
             # Step 2: Collect all statement_ids across all conversations
             all_statement_ids: list[str] = []
             conversation_messages: dict[str, list[GenieMessage]] = {}
@@ -1236,6 +1251,10 @@ class DatabricksClient:
                                 )
                     except Exception as e:
                         print(f"[DEBUG] Error fetching metrics for batch: {e}")
+            
+            # NOTE: Concurrency metrics (genie_concurrent, warehouse_concurrent) are calculated
+            # on-demand when a user selects a specific query for detailed view via load_query_concurrency().
+            # This avoids N+M SQL calls during initial load which was causing significant delays.
             
             print(f"[DEBUG] Fetched metrics for {len(query_metrics_map)} queries")
             

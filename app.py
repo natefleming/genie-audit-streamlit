@@ -1470,8 +1470,8 @@ def render_conversation_tree(
                     bottleneck_class = f"bottleneck-{query.bottleneck.lower()}"
                     speed_class = f"speed-{query.speed_category.lower()}"
                     
-                    # Create columns for query row: sql, duration, ai, compile, execute, queue, bottleneck, profile, pdf
-                    q_cols = st.columns([3.0, 0.8, 0.8, 0.8, 0.8, 0.8, 1, 0.5, 0.5])
+                    # Create columns for query row: sql, duration, ai, compile, execute, queue, genie_conc, wh_conc, bottleneck, profile, pdf
+                    q_cols = st.columns([2.5, 0.7, 0.7, 0.7, 0.7, 0.7, 0.6, 0.6, 0.9, 0.4, 0.4])
                     
                     with q_cols[0]:
                         st.code(query_preview, language="sql")
@@ -1492,18 +1492,24 @@ def render_conversation_tree(
                         st.caption(f"Queue: {query.queue_wait_ms/1000:.1f}s")
                     
                     with q_cols[6]:
+                        st.caption(f"Genie: {query.genie_concurrent}")
+                    
+                    with q_cols[7]:
+                        st.caption(f"WH: {query.warehouse_concurrent}")
+                    
+                    with q_cols[8]:
                         bottleneck_label = get_bottleneck_label(query.bottleneck)
                         color = get_bottleneck_color(query.bottleneck)
                         st.markdown(f"<span style='background:{color}20;color:{color};padding:2px 6px;border-radius:4px;font-size:10px;'>{bottleneck_label}</span>", unsafe_allow_html=True)
                     
-                    with q_cols[7]:
+                    with q_cols[9]:
                         # Query profile link
                         client = get_client()
                         profile_url = client.get_query_profile_url(query.statement_id)
                         if profile_url:
                             st.link_button("🔗", profile_url, help="View query profile in Databricks")
                     
-                    with q_cols[8]:
+                    with q_cols[10]:
                         # PDF download button
                         query_dict = {
                             "statement_id": query.statement_id,
@@ -1810,27 +1816,27 @@ def main() -> None:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                status_text.markdown("**Step 1/6:** Calculating aggregate metrics (query count, avg duration, success rate)...")
+                status_text.markdown("**Step 1/8:** Calculating aggregate metrics (query count, avg duration, success rate)...")
                 metrics = load_space_metrics(client, room_id, hours)
-                progress_bar.progress(15)
+                progress_bar.progress(12)
                 
-                status_text.markdown("**Step 2/6:** Loading daily query volume and latency trends...")
+                status_text.markdown("**Step 2/8:** Loading daily query volume and latency trends...")
                 daily_df = load_daily_trends(client, room_id, hours)
-                progress_bar.progress(30)
+                progress_bar.progress(25)
                 
-                status_text.markdown("**Step 3/6:** Analyzing query duration distribution (< 1s, 1-5s, 5-10s, etc.)...")
+                status_text.markdown("**Step 3/8:** Analyzing query duration distribution (< 1s, 1-5s, 5-10s, etc.)...")
                 duration_df = load_duration_distribution(client, room_id, hours)
-                progress_bar.progress(45)
+                progress_bar.progress(37)
                 
-                status_text.markdown("**Step 4/6:** Analyzing response time breakdown (AI processing + SQL execution phases)...")
+                status_text.markdown("**Step 4/8:** Analyzing response time breakdown (AI processing + SQL execution phases)...")
                 phase_df = load_phase_breakdown(client, room_id, hours)
-                progress_bar.progress(60)
+                progress_bar.progress(50)
                 
-                status_text.markdown("**Step 5/7:** Fetching individual queries with timing breakdown...")
+                status_text.markdown("**Step 5/8:** Fetching individual queries with timing breakdown...")
                 queries_df = load_queries(client, room_id, hours)
-                progress_bar.progress(65)
+                progress_bar.progress(62)
                 
-                status_text.markdown("**Step 6/7:** Resolving user prompts via Genie Conversations API...")
+                status_text.markdown("**Step 6/8:** Resolving user prompts via Genie Conversations API...")
                 # Populate prompts for all queries using reverse lookup
                 if not queries_df.empty:
                     prompts_dict = client.get_prompts_for_queries(room_id, queries_df)
@@ -1839,12 +1845,12 @@ def main() -> None:
                     )
                 else:
                     queries_df["user_prompt"] = ""
-                progress_bar.progress(85)
+                progress_bar.progress(75)
                 
                 status_text.markdown("**Step 7/8:** Loading AI conversation activity from audit logs...")
                 conversation_daily_df = load_conversation_daily(client, room_id, hours)
                 conversation_peak = load_conversation_peak(client, room_id, hours)
-                progress_bar.progress(90)
+                progress_bar.progress(87)
                 
                 status_text.markdown("**Step 8/8:** Loading conversation tree with SQL query lineage...")
                 conversations_with_metrics = load_conversations_with_metrics(client, room_id, max_conversations=50)

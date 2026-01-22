@@ -601,6 +601,56 @@ SELECT
   ) AS warehouse_concurrent
 """
 
+
+# Batch query to compute concurrency for all queries in a space
+# Mirrors the prior per-query logic (point-in-time at query start) but batched
+BATCH_CONCURRENCY_QUERY = """
+WITH space_queries AS (
+    SELECT 
+        statement_id,
+        start_time,
+        COALESCE(end_time, current_timestamp()) AS end_time,
+        compute.warehouse_id AS warehouse_id
+    FROM system.query.history
+    WHERE query_source.genie_space_id = '{space_id}'
+      AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+),
+warehouse_queries AS (
+    SELECT 
+        statement_id,
+        start_time,
+        COALESCE(end_time, current_timestamp()) AS end_time,
+        compute.warehouse_id AS warehouse_id
+    FROM system.query.history
+    WHERE start_time >= current_timestamp() - INTERVAL {hours} HOUR
+)
+SELECT 
+    q1.statement_id,
+    -- Genie concurrency: other queries in the same Genie space overlapping at query start
+    (SELECT COUNT(*) 
+     FROM space_queries q2 
+     WHERE q2.start_time <= q1.start_time 
+       AND q2.end_time >= q1.start_time
+       AND q2.statement_id != q1.statement_id
+    ) AS genie_concurrent,
+    -- Warehouse concurrency: other queries on same warehouse overlapping at query start
+    (SELECT COUNT(*) 
+     FROM warehouse_queries w2
+     WHERE w2.warehouse_id = q1.warehouse_id
+       AND q1.warehouse_id IS NOT NULL
+       AND w2.start_time <= q1.start_time
+       AND w2.end_time >= q1.start_time
+       AND w2.statement_id != q1.statement_id
+    ) AS warehouse_concurrent
+FROM space_queries q1
+"""
+
+
+def get_batch_concurrency_query(space_id: str, hours: int = 720) -> str:
+    """Build query to get concurrency metrics for all queries in a space."""
+    return BATCH_CONCURRENCY_QUERY.format(space_id=space_id, hours=hours)
+
+
 # ============================================================================
 # USER STATISTICS
 # ============================================================================
