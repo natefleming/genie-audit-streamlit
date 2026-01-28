@@ -101,8 +101,10 @@ The application queries these Databricks system tables:
 
 | Table | Purpose |
 |-------|---------|
-| `system.query.history` | SQL execution metrics, timing, and metadata |
-| `system.access.audit` | Genie API events for AI overhead calculation |
+| `{catalog}.query.history` | SQL execution metrics, timing, and metadata |
+| `{catalog}.access.audit` | Genie API events for AI overhead calculation |
+
+By default, `{catalog}` is `system`. Set the `SYSTEM_CATALOG` environment variable to use a different catalog.
 
 ## Prerequisites
 
@@ -124,6 +126,7 @@ The application queries these Databricks system tables:
    export DATABRICKS_HOST="https://your-workspace.cloud.databricks.com"
    export DATABRICKS_TOKEN="your-token"
    export DATABRICKS_WAREHOUSE_ID="your-warehouse-id"
+   export SYSTEM_CATALOG="system"  # Optional: defaults to "system"
    ```
 
 3. Run locally:
@@ -173,10 +176,21 @@ genie-audit-streamlit/
 
 ## Configuration
 
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DATABRICKS_HOST` | Yes (local) | - | Workspace URL |
+| `DATABRICKS_TOKEN` | Yes (local) | - | Personal access token |
+| `DATABRICKS_WAREHOUSE_ID` | Yes | - | SQL warehouse ID for query execution |
+| `SYSTEM_CATALOG` | No | `system` | Catalog containing system tables (`query.history`, `access.audit`) |
+| `STREAMLIT_THEME_BASE` | No | `dark` | Streamlit theme (`dark` or `light`) |
+
 ### app.yaml
 Controls Databricks Apps runtime:
 - Streamlit server settings
 - Warehouse ID for SQL execution
+- System catalog configuration
 
 ### databricks.yml
 Controls deployment:

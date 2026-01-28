@@ -2,7 +2,7 @@
 Databricks Client Service
 
 Provides a wrapper around the Databricks SDK WorkspaceClient for:
-- Executing SQL queries against system.query.history
+- Executing SQL queries against system tables (query.history, access.audit)
 - Listing and retrieving Genie spaces
 - Caching results for performance
 """
@@ -17,6 +17,8 @@ import time
 import pandas as pd
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementState
+
+from queries.sql import QUERY_HISTORY_TABLE, AUDIT_TABLE
 
 
 @dataclass
@@ -472,7 +474,44 @@ class DatabricksClient:
             
         except Exception as e:
             print(f"REST API list spaces failed: {e}")
-            return []
+        
+        # Fallback/supplement: Query system tables to find spaces with activity
+        # This catches spaces that aren't returned by the API but have query history
+        try:
+            from queries.sql import get_spaces_from_system_tables_query
+            
+            print("[DEBUG] Querying system tables for additional spaces...")
+            space_ids_from_api = {s.id for s in spaces}
+            
+            sql = get_spaces_from_system_tables_query(hours=720)  # 30 days
+            df = self.execute_sql(sql, use_cache=True)
+            
+            if not df.empty:
+                added_count = 0
+                for _, row in df.iterrows():
+                    space_id = str(row.get("space_id", "") or "")
+                    if space_id and space_id not in space_ids_from_api:
+                        query_count = int(row.get("query_count", 0) or 0)
+                        spaces.append(GenieSpace(
+                            id=space_id,
+                            name=f"📊 Space {space_id[:12]}... ({query_count} queries)",
+                            description="Discovered from system tables (not in API list)",
+                            created_at="",
+                            warehouse_id=None,
+                            owner=None,
+                        ))
+                        added_count += 1
+                
+                if added_count > 0:
+                    print(f"[DEBUG] Added {added_count} spaces from system tables")
+                    if progress_callback:
+                        progress_callback(len(spaces), False, None)
+        except Exception as e:
+            print(f"[DEBUG] System tables query for spaces failed: {e}")
+        
+        if spaces:
+            self._set_cached(cache_key, spaces)
+        return spaces
     
     def get_genie_space(self, space_id: str) -> Optional[GenieSpace]:
         """
@@ -707,6 +746,46 @@ class DatabricksClient:
             print(f"[DEBUG] SDK list_conversations failed: {e}")
             import traceback
             traceback.print_exc()
+            
+            # Fallback: Query conversations from audit logs
+            # This works even if the Genie space was deleted or is inaccessible
+            print(f"[DEBUG] Trying fallback: query conversations from audit logs...")
+            try:
+                from queries.sql import get_conversations_from_audit_query
+                
+                fallback_sql = get_conversations_from_audit_query(
+                    space_id=space_id,
+                    hours=720,  # 30 days
+                    max_conversations=max_conversations
+                )
+                fallback_df = self.execute_sql(fallback_sql, use_cache=True)
+                
+                if not fallback_df.empty:
+                    for _, row in fallback_df.iterrows():
+                        conv_id = str(row.get("conversation_id", "") or "")
+                        if conv_id:
+                            # Truncate title to first 100 chars if it's a user message
+                            title = str(row.get("title", "") or "")
+                            if len(title) > 100:
+                                title = title[:100] + "..."
+                            
+                            conversations.append(GenieConversation(
+                                conversation_id=conv_id,
+                                title=title or f"Conversation {conv_id[:8]}",
+                                created_time=str(row.get("created_time", "") or ""),
+                                last_updated_time="",
+                            ))
+                    
+                    print(f"[DEBUG] Fallback found {len(conversations)} conversations from audit logs")
+                    if conversations:
+                        self._set_cached(cache_key, conversations)
+                    return conversations
+                else:
+                    print(f"[DEBUG] Fallback: No conversations found in audit logs for space {space_id}")
+            except Exception as fallback_err:
+                print(f"[DEBUG] Fallback query also failed: {fallback_err}")
+                traceback.print_exc()
+            
             return []
     
     def get_conversation_messages(
@@ -784,6 +863,43 @@ class DatabricksClient:
             print(f"[DEBUG] SDK get_messages failed for {conversation_id}: {e}")
             import traceback
             traceback.print_exc()
+            
+            # Fallback: Query messages from audit logs
+            # This works even if the Genie space was deleted or is inaccessible
+            print(f"[DEBUG] Trying fallback: query messages from audit logs...")
+            try:
+                from queries.sql import get_messages_from_audit_query
+                
+                fallback_sql = get_messages_from_audit_query(
+                    space_id=space_id,
+                    conversation_id=conversation_id,
+                    hours=720  # 30 days
+                )
+                fallback_df = self.execute_sql(fallback_sql, use_cache=True)
+                
+                if not fallback_df.empty:
+                    for _, row in fallback_df.iterrows():
+                        msg_id = str(row.get("message_id", "") or "")
+                        if msg_id:
+                            msg_obj = GenieMessage(
+                                message_id=msg_id,
+                                content=str(row.get("content", "") or ""),
+                                status="COMPLETED",  # Assume completed since it's historical
+                                created_timestamp=0,  # Not available from audit
+                                attachments=[],  # Will be populated from query history
+                            )
+                            messages.append(msg_obj)
+                    
+                    print(f"[DEBUG] Fallback found {len(messages)} messages from audit logs")
+                    if messages:
+                        self._set_cached(cache_key, messages)
+                    return messages
+                else:
+                    print(f"[DEBUG] Fallback: No messages found in audit logs for conversation {conversation_id}")
+            except Exception as fallback_err:
+                print(f"[DEBUG] Fallback query also failed: {fallback_err}")
+                traceback.print_exc()
+            
             return []
     
     def _normalize_sql(self, sql: str) -> str:
@@ -1000,7 +1116,7 @@ class DatabricksClient:
             AVG(total_duration_ms) as avg_duration_ms,
             SUM(CASE WHEN total_duration_ms > 30000 THEN 1 ELSE 0 END) as slow_query_count,
             ROUND(100.0 * SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) / COUNT(*), 1) as success_rate
-        FROM system.query.history
+        FROM {QUERY_HISTORY_TABLE}
         WHERE start_time >= current_date() - INTERVAL {days} DAYS
           AND query_source.genie_space_id IS NOT NULL
         GROUP BY query_source.genie_space_id
@@ -1068,6 +1184,7 @@ class DatabricksClient:
             get_conversation_sources_query,
             get_message_ai_overhead_query,
             get_queries_by_space_and_time,
+            get_batch_messages_from_audit_query,
         )
         from datetime import datetime, timedelta
         
@@ -1077,6 +1194,10 @@ class DatabricksClient:
             return cached
         
         result: list[ConversationWithMessages] = []
+        
+        # Track if we're using the fallback path (Genie API unavailable)
+        using_audit_fallback = False
+        batch_messages_by_conv: dict[str, list[GenieMessage]] = {}
         
         try:
             # Step 1: List conversations
@@ -1088,6 +1209,44 @@ class DatabricksClient:
             
             if not conversations:
                 return result
+            
+            # Step 1a: Try to detect if Genie API is working by testing get_genie_space
+            # If it fails, we're in fallback mode and should batch-load messages from audit
+            try:
+                test_space = self._client.genie.get_space(space_id=space_id)
+                print(f"[DEBUG] Genie API is available for space {space_id}")
+            except Exception as api_err:
+                print(f"[DEBUG] Genie API unavailable, using audit fallback mode: {api_err}")
+                using_audit_fallback = True
+                
+                # Batch load ALL messages for this space from audit logs in one query
+                if progress_callback:
+                    progress_callback(0, max_conversations, "Loading messages from audit logs (batch)...")
+                
+                try:
+                    batch_msg_sql = get_batch_messages_from_audit_query(space_id=space_id, hours=720)
+                    batch_msg_df = self.execute_sql(batch_msg_sql, use_cache=True)
+                    
+                    if not batch_msg_df.empty:
+                        for _, row in batch_msg_df.iterrows():
+                            conv_id = str(row.get("conversation_id", "") or "")
+                            msg_id = str(row.get("message_id", "") or "")
+                            if conv_id and msg_id:
+                                if conv_id not in batch_messages_by_conv:
+                                    batch_messages_by_conv[conv_id] = []
+                                
+                                msg_obj = GenieMessage(
+                                    message_id=msg_id,
+                                    content=str(row.get("content", "") or ""),
+                                    status="COMPLETED",
+                                    created_timestamp=0,
+                                    attachments=[],  # Will be populated from query history
+                                )
+                                batch_messages_by_conv[conv_id].append(msg_obj)
+                        
+                        print(f"[DEBUG] Batch loaded messages for {len(batch_messages_by_conv)} conversations from audit")
+                except Exception as batch_err:
+                    print(f"[DEBUG] Batch message loading failed: {batch_err}")
             
             # Step 1b: Fetch conversation sources from audit logs
             # This tells us if each conversation was initiated via API or Genie Space UI
@@ -1193,18 +1352,26 @@ class DatabricksClient:
             all_statement_ids: list[str] = []
             conversation_messages: dict[str, list[GenieMessage]] = {}
             
-            for i, conv in enumerate(conversations):
-                if progress_callback:
-                    progress_callback(i + 1, len(conversations), f"Loading messages for conversation {i + 1}...")
-                
-                messages = self.get_conversation_messages(space_id, conv.conversation_id)
-                conversation_messages[conv.conversation_id] = messages
-                
-                # Extract statement_ids from attachments
-                for msg in messages:
-                    for att in msg.attachments:
-                        if att.statement_id:
-                            all_statement_ids.append(att.statement_id)
+            if using_audit_fallback:
+                # Use batch-loaded messages from audit logs
+                print(f"[DEBUG] Using batch-loaded messages from audit fallback")
+                for conv in conversations:
+                    conversation_messages[conv.conversation_id] = batch_messages_by_conv.get(conv.conversation_id, [])
+                # In fallback mode, attachments are empty - we'll use time-based correlation with query history
+            else:
+                # Normal path: load messages via Genie API
+                for i, conv in enumerate(conversations):
+                    if progress_callback:
+                        progress_callback(i + 1, len(conversations), f"Loading messages for conversation {i + 1}...")
+                    
+                    messages = self.get_conversation_messages(space_id, conv.conversation_id)
+                    conversation_messages[conv.conversation_id] = messages
+                    
+                    # Extract statement_ids from attachments
+                    for msg in messages:
+                        for att in msg.attachments:
+                            if att.statement_id:
+                                all_statement_ids.append(att.statement_id)
             
             print(f"[DEBUG] Found {len(all_statement_ids)} statement_ids across all conversations")
             

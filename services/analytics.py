@@ -8,6 +8,8 @@ and optimization recommendations for Genie queries.
 from typing import Optional
 from dataclasses import dataclass
 
+from queries.sql import QUERY_HISTORY_TABLE, AUDIT_TABLE
+
 
 @dataclass
 class QueryOptimization:
@@ -448,7 +450,7 @@ SELECT
     waiting_for_compute_duration_ms,
     waiting_at_capacity_duration_ms,
     statement_text
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE statement_id = '{statement_id}'"""
         ))
     
@@ -468,7 +470,7 @@ SELECT
     SUM(CASE WHEN waiting_for_compute_duration_ms > 10000 THEN 1 ELSE 0 END) AS cold_starts,
     ROUND(100.0 * SUM(CASE WHEN waiting_for_compute_duration_ms > 10000 THEN 1 ELSE 0 END) / COUNT(*), 1) AS cold_start_pct,
     ROUND(AVG(waiting_for_compute_duration_ms) / 1000.0, 1) AS avg_startup_sec
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id = '{genie_space_id}'
     AND start_time >= current_timestamp() - INTERVAL 7 DAY
 GROUP BY warehouse_id, DATE(start_time)
@@ -484,7 +486,7 @@ WITH query_times AS (
     SELECT 
         start_time,
         LAG(end_time) OVER (ORDER BY start_time) AS prev_end_time
-    FROM system.query.history
+    FROM {QUERY_HISTORY_TABLE}
     WHERE query_source.genie_space_id IS NOT NULL
         AND start_time >= current_timestamp() - INTERVAL 1 DAY
 )
@@ -514,7 +516,7 @@ SELECT
     ROUND(AVG(waiting_at_capacity_duration_ms) / 1000.0, 1) AS avg_queue_sec,
     MAX(waiting_at_capacity_duration_ms) / 1000.0 AS max_queue_sec,
     SUM(CASE WHEN waiting_at_capacity_duration_ms > 5000 THEN 1 ELSE 0 END) AS queued_queries
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id = '{genie_space_id}'
     AND start_time >= current_timestamp() - INTERVAL 7 DAY
 GROUP BY DATE_TRUNC('hour', start_time)
@@ -535,15 +537,15 @@ SELECT
     end_time,
     total_duration_ms / 1000.0 AS duration_sec,
     LEFT(statement_text, 200) AS query_preview
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE start_time >= (
     SELECT start_time - INTERVAL 5 MINUTE
-    FROM system.query.history 
+    FROM {QUERY_HISTORY_TABLE} 
     WHERE statement_id = '{statement_id}'
 )
 AND end_time <= (
     SELECT end_time + INTERVAL 5 MINUTE
-    FROM system.query.history 
+    FROM {QUERY_HISTORY_TABLE} 
     WHERE statement_id = '{statement_id}'
 )
 AND statement_id != '{statement_id}'
@@ -566,7 +568,7 @@ SELECT
     ROUND(AVG(compilation_duration_ms) / 1000.0, 1) AS avg_compile_sec,
     ROUND(AVG(total_duration_ms) / 1000.0, 1) AS avg_total_sec,
     ROUND(100.0 * AVG(compilation_duration_ms) / NULLIF(AVG(total_duration_ms), 0), 0) AS compile_pct
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id = '{genie_space_id}'
     AND start_time >= current_timestamp() - INTERVAL 7 DAY
     AND compilation_duration_ms > 2000
@@ -590,7 +592,7 @@ SELECT
     ROUND(SUM(read_bytes) / (1024*1024*1024), 1) AS total_gb_scanned,
     ROUND(AVG(read_bytes) / (1024*1024*1024), 2) AS avg_gb_per_query,
     ROUND(MAX(read_bytes) / (1024*1024*1024), 2) AS max_gb_scanned
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id = '{genie_space_id}'
     AND start_time >= current_timestamp() - INTERVAL 7 DAY
 GROUP BY DATE(start_time)
@@ -639,7 +641,7 @@ SELECT
     ROUND(AVG(execution_duration_ms) / 1000.0, 1) AS avg_exec_sec,
     ROUND(MAX(execution_duration_ms) / 1000.0, 1) AS max_exec_sec,
     ROUND(AVG(read_bytes) / (1024*1024), 0) AS avg_mb_read
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id = '{genie_space_id}'
     AND start_time >= current_timestamp() - INTERVAL 7 DAY
     AND execution_duration_ms > 10000
@@ -662,7 +664,7 @@ LIMIT 10"""
 SELECT 
     statement_id,
     CONCAT('https://', current_catalog(), '.cloud.databricks.com/sql/history/', statement_id) AS query_profile_url
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE statement_id = '{statement_id}'"""
         ))
     
@@ -683,7 +685,7 @@ SELECT
     SUM(CASE WHEN total_duration_ms > 10000 THEN 1 ELSE 0 END) AS slow_queries,
     ROUND(100.0 * SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_pct,
     COUNT(DISTINCT executed_by) AS unique_users
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id = '{genie_space_id}'
     AND start_time >= current_timestamp() - INTERVAL 7 DAY"""
     ))
@@ -697,8 +699,8 @@ WHERE query_source.genie_space_id = '{genie_space_id}'
         category="monitoring",
         sql=f"""-- Correlate SQL query history with Genie API audit events
 -- This query shows the relationship between:
---   - system.query.history: SQL execution metrics (statement_id, duration, etc.)
---   - system.access.audit: Genie API events (request_id, action_name, etc.)
+--   - {QUERY_HISTORY_TABLE}: SQL execution metrics (statement_id, duration, etc.)
+--   - {AUDIT_TABLE}: Genie API events (request_id, action_name, etc.)
 
 WITH genie_messages AS (
     -- Get Genie conversation/message events from audit logs
@@ -709,7 +711,7 @@ WITH genie_messages AS (
         event_time AS message_time,
         action_name,
         user_identity.email AS user_email
-    FROM system.access.audit
+    FROM {AUDIT_TABLE}
     WHERE service_name = 'genieV2'
       AND action_name IN ('genieStartConversationMessage', 'genieContinueConversationMessage')
       AND request_params.space_id = '{genie_space_id}'
@@ -726,7 +728,7 @@ sql_queries AS (
         total_duration_ms,
         execution_status,
         LEFT(statement_text, 200) AS query_preview
-    FROM system.query.history
+    FROM {QUERY_HISTORY_TABLE}
     WHERE query_source.genie_space_id = '{genie_space_id}'
       AND start_time >= current_timestamp() - INTERVAL 7 DAY
 )
@@ -800,24 +802,24 @@ LIMIT 100"""
 -- Genie Space ID: {genie_space_id}
 SELECT 
     (SELECT MIN(event_time) 
-     FROM system.access.audit 
+     FROM {AUDIT_TABLE} 
      WHERE service_name = 'genieV2'
        AND action_name LIKE 'genie%Message'
        AND request_params.space_id = '{genie_space_id}'
        AND event_time BETWEEN 
-           (SELECT start_time - INTERVAL 60 SECOND FROM system.query.history WHERE statement_id = '{statement_id}')
-           AND (SELECT start_time FROM system.query.history WHERE statement_id = '{statement_id}')
+           (SELECT start_time - INTERVAL 60 SECOND FROM {QUERY_HISTORY_TABLE} WHERE statement_id = '{statement_id}')
+           AND (SELECT start_time FROM {QUERY_HISTORY_TABLE} WHERE statement_id = '{statement_id}')
     ) AS message_time,
     start_time AS sql_start_time,
     ROUND((UNIX_TIMESTAMP(start_time) - UNIX_TIMESTAMP(
         (SELECT MIN(event_time) 
-         FROM system.access.audit 
+         FROM {AUDIT_TABLE} 
          WHERE service_name = 'genieV2'
            AND action_name LIKE 'genie%Message'
            AND request_params.space_id = '{genie_space_id}'
            AND event_time BETWEEN start_time - INTERVAL 60 SECOND AND start_time)
     )), 1) AS ai_overhead_sec
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE statement_id = '{statement_id}'"""
     ))
     

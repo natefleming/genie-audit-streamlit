@@ -12,6 +12,7 @@ import pandas as pd
 from fpdf import FPDF
 
 from services.analytics import get_query_optimizations, get_diagnostic_queries, get_bottleneck_recommendation
+from queries.sql import QUERY_HISTORY_TABLE, AUDIT_TABLE
 
 
 class GenieAuditReport(FPDF):
@@ -769,7 +770,7 @@ def generate_query_pdf_report(
     # Query history lookup
     pdf.subsection_title("Query Details from History")
     pdf.code_block(f"""SELECT *
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE statement_id = '{statement_id}'""")
     
     # Query profile
@@ -787,7 +788,7 @@ WHERE statement_id = '{statement_id}'""")
   total_duration_ms / 1000.0 as duration_sec,
   execution_status,
   LEFT(statement_text, 100) as query_preview
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id = '{room_id}'
   AND start_time BETWEEN 
     TIMESTAMP'{start_time}' - INTERVAL 5 MINUTE
@@ -811,7 +812,7 @@ WITH genie_message AS (
     request_params.conversation_id,
     event_time AS message_time,
     action_name
-  FROM system.access.audit
+  FROM {AUDIT_TABLE}
   WHERE service_name = 'genieV2'
     AND action_name LIKE 'genie%Message'
     AND request_params.space_id = '{room_id}'
@@ -828,7 +829,7 @@ sql_query AS (
     end_time,
     total_duration_ms,
     execution_status
-  FROM system.query.history
+  FROM {QUERY_HISTORY_TABLE}
   WHERE statement_id = '{statement_id}'
 )
 SELECT 

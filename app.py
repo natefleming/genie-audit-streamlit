@@ -568,7 +568,27 @@ def render_room_selector(client: DatabricksClient) -> Optional[str]:
         current_user = st.session_state.get("current_user")
     
     if not rooms:
-        st.warning("No Genie rooms found. Make sure there are queries from Genie rooms in the last 90 days.")
+        st.warning("No Genie rooms found via API. You can manually enter a space ID below.")
+    
+    # Allow manual space ID entry (useful when room isn't visible in list)
+    with st.expander("📝 Enter Space ID manually", expanded=not rooms):
+        manual_space_id = st.text_input(
+            "Space ID",
+            placeholder="e.g., 01f0c482e842191587af6a40ad4044d8",
+            help="Enter a Genie space ID directly if the room isn't showing in the list above",
+            key="manual_space_id"
+        )
+        if manual_space_id and manual_space_id.strip():
+            # Validate it looks like a space ID (hex string)
+            clean_id = manual_space_id.strip()
+            if len(clean_id) >= 16:
+                st.success(f"Using manual space ID: {clean_id[:12]}...")
+                st.session_state["selected_room_name"] = f"Manual: {clean_id[:12]}..."
+                return clean_id
+            else:
+                st.error("Space ID should be at least 16 characters (hex string)")
+    
+    if not rooms:
         return None
     
     # Sort rooms: user's rooms first (marked with ⭐), then alphabetically
@@ -600,36 +620,21 @@ def render_room_selector(client: DatabricksClient) -> Optional[str]:
     # Combine: my rooms first, then others
     sorted_rooms = my_rooms + other_rooms
     
-    # Search input for filtering by name or space ID
-    search_term = st.text_input(
-        "Search rooms",
-        placeholder="Search by name or space ID...",
-        label_visibility="collapsed",
-        key="room_search"
-    )
-    
-    # Filter rooms based on search term (matches name OR ID)
-    if search_term:
-        search_lower = search_term.lower().strip()
-        filtered_rooms = [
-            (room_id, display_name, name) 
-            for room_id, display_name, name in sorted_rooms
-            if search_lower in name.lower() or search_lower in room_id.lower()
-        ]
-    else:
-        filtered_rooms = sorted_rooms
-    
     # Create options with display name and ID
-    room_options = {display_name: room_id for room_id, display_name, _ in filtered_rooms}
-    room_names = ["Select a Genie Room..."] + [display_name for _, display_name, _ in filtered_rooms]
+    room_options = {display_name: room_id for room_id, display_name, _ in sorted_rooms}
+    room_names = ["Select a Genie Room..."] + [display_name for _, display_name, _ in sorted_rooms]
     
-    # Show count with breakdown
-    count_msg = f"📋 {len(rooms)} Genie rooms"
-    if my_rooms:
-        count_msg += f" ({len(my_rooms)} owned by you)"
-    if search_term and len(filtered_rooms) != len(sorted_rooms):
-        count_msg += f" • Showing {len(filtered_rooms)} matching '{search_term}'"
-    st.caption(count_msg)
+    # Show count with breakdown and refresh button
+    count_col, refresh_col = st.columns([4, 1])
+    with count_col:
+        count_msg = f"📋 {len(rooms)} Genie rooms"
+        if my_rooms:
+            count_msg += f" ({len(my_rooms)} owned by you)"
+        st.caption(count_msg)
+    with refresh_col:
+        if st.button("🔄", help="Refresh room list from API", key="refresh_rooms"):
+            st.session_state["rooms_need_refresh"] = True
+            st.rerun()
     
     selected_name = st.selectbox(
         "Genie Room",

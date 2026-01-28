@@ -7,11 +7,24 @@ Consolidated from:
 - genie_performance_audit.sql
 """
 
+import os
+
+# ============================================================================
+# CONFIGURABLE SYSTEM TABLE CATALOG
+# ============================================================================
+# Set SYSTEM_CATALOG environment variable to override the default catalog.
+# Default: "system" (standard Unity Catalog system tables)
+# Example: export SYSTEM_CATALOG="my_custom_catalog"
+
+SYSTEM_CATALOG = os.environ.get("SYSTEM_CATALOG", "system")
+QUERY_HISTORY_TABLE = f"{SYSTEM_CATALOG}.query.history"
+AUDIT_TABLE = f"{SYSTEM_CATALOG}.access.audit"
+
 # ============================================================================
 # GLOBAL SUMMARY QUERIES
 # ============================================================================
 
-SUMMARY_STATS_QUERY = """
+SUMMARY_STATS_QUERY = f"""
 SELECT
   COUNT(*) AS total_queries,
   COUNT(DISTINCT query_source.genie_space_id) AS genie_spaces,
@@ -24,16 +37,35 @@ SELECT
   SUM(CASE WHEN total_duration_ms >= 10000 THEN 1 ELSE 0 END) AS slow_10s,
   SUM(CASE WHEN total_duration_ms >= 30000 THEN 1 ELSE 0 END) AS slow_30s,
   ROUND(100.0 * SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_rate_pct
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
 """
 
 # ============================================================================
 # GENIE SPACES QUERIES
 # ============================================================================
 
-GENIE_SPACES_QUERY = """
+# Discover spaces from system tables (useful when API doesn't list them)
+SPACES_FROM_SYSTEM_TABLES_QUERY = f"""
+SELECT 
+    query_source.genie_space_id AS space_id,
+    COUNT(*) AS query_count,
+    MAX(start_time) AS last_activity
+FROM {QUERY_HISTORY_TABLE}
+WHERE query_source.genie_space_id IS NOT NULL
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+GROUP BY query_source.genie_space_id
+ORDER BY last_activity DESC
+"""
+
+
+def get_spaces_from_system_tables_query(hours: int = 720) -> str:
+    """Build query to discover Genie spaces from system tables."""
+    return SPACES_FROM_SYSTEM_TABLES_QUERY.format(hours=hours)
+
+
+GENIE_SPACES_QUERY = f"""
 SELECT
   query_source.genie_space_id AS genie_space_id,
   COUNT(*) AS total_queries,
@@ -47,14 +79,14 @@ SELECT
   SUM(CASE WHEN total_duration_ms >= 30000 THEN 1 ELSE 0 END) AS slow_30s,
   ROUND(100.0 * SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_rate_pct,
   ROUND(SUM(COALESCE(read_bytes, 0)) / 1024.0 / 1024.0 / 1024.0, 2) AS total_gb_read
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
 GROUP BY query_source.genie_space_id
 ORDER BY total_queries DESC
 """
 
-SPACE_METRICS_QUERY = """
+SPACE_METRICS_QUERY = f"""
 SELECT
   COUNT(*) AS total_queries,
   COUNT(DISTINCT executed_by) AS unique_users,
@@ -68,16 +100,16 @@ SELECT
   SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) AS successful_queries,
   SUM(CASE WHEN execution_status = 'FAILED' THEN 1 ELSE 0 END) AS failed_queries,
   ROUND(100.0 * SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_rate_pct
-FROM system.query.history
-WHERE query_source.genie_space_id = '{space_id}'
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+FROM {QUERY_HISTORY_TABLE}
+WHERE query_source.genie_space_id = '{{space_id}}'
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
 """
 
 # ============================================================================
 # BOTTLENECK ANALYSIS
 # ============================================================================
 
-BOTTLENECK_DISTRIBUTION_QUERY = """
+BOTTLENECK_DISTRIBUTION_QUERY = f"""
 SELECT
   CASE
     WHEN COALESCE(waiting_for_compute_duration_ms, 0) > total_duration_ms * 0.5 THEN 'Compute Startup'
@@ -90,10 +122,10 @@ SELECT
   COUNT(*) AS query_count,
   ROUND(SUM(total_duration_ms) / 1000.0 / 60.0, 2) AS total_time_min,
   ROUND(AVG(total_duration_ms) / 1000.0, 2) AS avg_duration_sec
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 GROUP BY 1
 ORDER BY total_time_min DESC
 """
@@ -103,16 +135,16 @@ ORDER BY total_time_min DESC
 # ============================================================================
 
 # Per-request breakdown correlating message events with SQL queries
-PER_REQUEST_BREAKDOWN_QUERY = """
+PER_REQUEST_BREAKDOWN_QUERY = f"""
 WITH message_starts AS (
     SELECT 
         event_time as start_time,
         request_params.space_id as space_id
-    FROM system.access.audit
+    FROM {AUDIT_TABLE}
     WHERE service_name = 'aibiGenie'
-      AND event_date >= current_timestamp() - INTERVAL {hours} HOUR
+      AND event_date >= current_timestamp() - INTERVAL {{hours}} HOUR
       AND action_name = 'genieStartConversationMessage'
-      {audit_space_filter}
+      {{audit_space_filter}}
 ),
 queries AS (
     SELECT 
@@ -125,10 +157,10 @@ queries AS (
         execution_duration_ms,
         waiting_at_capacity_duration_ms,
         waiting_for_compute_duration_ms
-    FROM system.query.history
+    FROM {QUERY_HISTORY_TABLE}
     WHERE query_source.genie_space_id IS NOT NULL
-      AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-      {space_filter}
+      AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+      {{space_filter}}
 ),
 per_request AS (
     SELECT 
@@ -190,16 +222,16 @@ ORDER BY phase_order
 """
 
 # Legacy query for backward compatibility (simple phase aggregation)
-PHASE_BREAKDOWN_QUERY = """
+PHASE_BREAKDOWN_QUERY = f"""
 SELECT 
   'Queue Wait' as phase,
   1 as phase_order,
   ROUND(COALESCE(SUM(waiting_at_capacity_duration_ms), 0) / 1000.0 / 60.0, 2) as time_min,
   ROUND(COALESCE(AVG(waiting_at_capacity_duration_ms), 0) / 1000.0, 2) as avg_sec
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 
 UNION ALL
 
@@ -208,10 +240,10 @@ SELECT
   2 as phase_order,
   ROUND(COALESCE(SUM(waiting_for_compute_duration_ms), 0) / 1000.0 / 60.0, 2) as time_min,
   ROUND(COALESCE(AVG(waiting_for_compute_duration_ms), 0) / 1000.0, 2) as avg_sec
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 
 UNION ALL
 
@@ -220,10 +252,10 @@ SELECT
   3 as phase_order,
   ROUND(COALESCE(SUM(compilation_duration_ms), 0) / 1000.0 / 60.0, 2) as time_min,
   ROUND(COALESCE(AVG(compilation_duration_ms), 0) / 1000.0, 2) as avg_sec
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 
 UNION ALL
 
@@ -232,10 +264,10 @@ SELECT
   4 as phase_order,
   ROUND(COALESCE(SUM(execution_duration_ms), 0) / 1000.0 / 60.0, 2) as time_min,
   ROUND(COALESCE(AVG(execution_duration_ms), 0) / 1000.0, 2) as avg_sec
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 
 ORDER BY phase_order
 """
@@ -244,7 +276,7 @@ ORDER BY phase_order
 # DURATION DISTRIBUTION
 # ============================================================================
 
-DURATION_HISTOGRAM_QUERY = """
+DURATION_HISTOGRAM_QUERY = f"""
 SELECT
   CASE
     WHEN total_duration_ms < 1000 THEN '< 1s'
@@ -263,10 +295,10 @@ SELECT
     ELSE 6
   END AS bucket_order,
   COUNT(*) AS query_count
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 GROUP BY 1, 2
 ORDER BY bucket_order
 """
@@ -275,7 +307,7 @@ ORDER BY bucket_order
 # TREND ANALYSIS
 # ============================================================================
 
-DAILY_TREND_QUERY = """
+DAILY_TREND_QUERY = f"""
 SELECT
   DATE(start_time) AS query_date,
   COUNT(*) AS total_queries,
@@ -284,25 +316,25 @@ SELECT
   ROUND(PERCENTILE(total_duration_ms, 0.90) / 1000.0, 2) AS p90_sec,
   ROUND(PERCENTILE(total_duration_ms, 0.95) / 1000.0, 2) AS p95_sec,
   ROUND(100.0 * SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_rate
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 GROUP BY DATE(start_time)
 ORDER BY query_date
 """
 
-HOURLY_PATTERN_QUERY = """
+HOURLY_PATTERN_QUERY = f"""
 SELECT
   HOUR(start_time) AS hour_of_day,
   COUNT(*) AS query_count,
   ROUND(AVG(total_duration_ms) / 1000.0, 2) AS avg_sec,
   ROUND(PERCENTILE(total_duration_ms, 0.90) / 1000.0, 2) AS p90_sec,
   SUM(CASE WHEN total_duration_ms >= 10000 THEN 1 ELSE 0 END) AS slow_count
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 GROUP BY HOUR(start_time)
 ORDER BY hour_of_day
 """
@@ -311,54 +343,54 @@ ORDER BY hour_of_day
 # TIME BREAKDOWN BY PHASE
 # ============================================================================
 
-TIME_BREAKDOWN_QUERY = """
+TIME_BREAKDOWN_QUERY = f"""
 SELECT
   'Compilation' AS phase,
   ROUND(SUM(COALESCE(compilation_duration_ms, 0)) / 1000.0 / 60.0, 2) AS total_minutes,
   ROUND(AVG(COALESCE(compilation_duration_ms, 0)) / 1000.0, 2) AS avg_seconds
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL 
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 UNION ALL
 SELECT 'Execution', 
   ROUND(SUM(COALESCE(execution_duration_ms, 0)) / 1000.0 / 60.0, 2), 
   ROUND(AVG(COALESCE(execution_duration_ms, 0)) / 1000.0, 2)
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL 
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 UNION ALL
 SELECT 'Wait for Compute', 
   ROUND(SUM(COALESCE(waiting_for_compute_duration_ms, 0)) / 1000.0 / 60.0, 2), 
   ROUND(AVG(COALESCE(waiting_for_compute_duration_ms, 0)) / 1000.0, 2)
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL 
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 UNION ALL
 SELECT 'Queue Wait', 
   ROUND(SUM(COALESCE(waiting_at_capacity_duration_ms, 0)) / 1000.0 / 60.0, 2), 
   ROUND(AVG(COALESCE(waiting_at_capacity_duration_ms, 0)) / 1000.0, 2)
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL 
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 UNION ALL
 SELECT 'Result Fetch', 
   ROUND(SUM(COALESCE(result_fetch_duration_ms, 0)) / 1000.0 / 60.0, 2), 
   ROUND(AVG(COALESCE(result_fetch_duration_ms, 0)) / 1000.0, 2)
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL 
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 """
 
 # ============================================================================
 # QUERY LISTINGS
 # ============================================================================
 
-QUERIES_LIST_QUERY = """
+QUERIES_LIST_QUERY = f"""
 WITH message_events AS (
   SELECT 
     event_time as message_time,
@@ -369,9 +401,9 @@ WITH message_events AS (
     request_id as message_id,
     user_identity.email as user_email,
     action_name
-  FROM system.access.audit
+  FROM {AUDIT_TABLE}
   WHERE service_name = 'aibiGenie'
-    AND event_date >= current_timestamp() - INTERVAL {hours} HOUR
+    AND event_date >= current_timestamp() - INTERVAL {{hours}} HOUR
     AND action_name IN (
       'genieStartConversationMessage',
       'genieContinueConversationMessage',
@@ -379,7 +411,7 @@ WITH message_events AS (
       'createConversationMessage',
       'regenerateConversationMessage'
     )
-    {audit_space_filter}
+    {{audit_space_filter}}
 ),
 queries AS (
   SELECT
@@ -421,11 +453,11 @@ queries AS (
       ELSE 'NORMAL'
     END AS bottleneck,
     LEFT(statement_text, 500) AS query_text
-  FROM system.query.history
+  FROM {QUERY_HISTORY_TABLE}
   WHERE query_source.genie_space_id IS NOT NULL
-    AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-    {space_filter}
-    {status_filter}
+    AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+    {{space_filter}}
+    {{status_filter}}
 ),
 query_with_message AS (
   SELECT 
@@ -481,10 +513,10 @@ SELECT
 FROM query_with_message
 WHERE rn = 1 OR rn IS NULL
 ORDER BY total_duration_ms DESC
-LIMIT {limit}
+LIMIT {{limit}}
 """
 
-SLOW_QUERIES_QUERY = """
+SLOW_QUERIES_QUERY = f"""
 SELECT
   statement_id,
   query_source.genie_space_id AS genie_space_id,
@@ -521,16 +553,16 @@ SELECT
   END AS recommendation,
   execution_status,
   LEFT(statement_text, 500) AS query_text
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
   AND total_duration_ms >= 10000
-  {space_filter}
+  {{space_filter}}
 ORDER BY total_duration_ms DESC
-LIMIT {limit}
+LIMIT {{limit}}
 """
 
-FAILED_QUERIES_QUERY = """
+FAILED_QUERIES_QUERY = f"""
 SELECT
   statement_id,
   query_source.genie_space_id AS genie_space_id,
@@ -539,20 +571,20 @@ SELECT
   execution_status,
   error_message,
   LEFT(statement_text, 500) AS query_text
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
   AND execution_status IN ('FAILED', 'CANCELED')
-  {space_filter}
+  {{space_filter}}
 ORDER BY start_time DESC
-LIMIT {limit}
+LIMIT {{limit}}
 """
 
 # ============================================================================
 # SINGLE QUERY DETAIL
 # ============================================================================
 
-QUERY_DETAIL_QUERY = """
+QUERY_DETAIL_QUERY = f"""
 SELECT
   statement_id,
   query_source.genie_space_id AS genie_space_id,
@@ -572,48 +604,48 @@ SELECT
   error_message,
   statement_text AS query_text,
   compute.warehouse_id AS warehouse_id
-FROM system.query.history
-WHERE statement_id = '{statement_id}'
+FROM {QUERY_HISTORY_TABLE}
+WHERE statement_id = '{{statement_id}}'
 """
 
 # ============================================================================
 # QUERY CONCURRENCY
 # ============================================================================
 
-QUERY_CONCURRENCY_QUERY = """
+QUERY_CONCURRENCY_QUERY = f"""
 SELECT 
   -- Genie concurrency: queries in same Genie space overlapping with this query
   (SELECT COUNT(*) 
-   FROM system.query.history h2 
-   WHERE h2.query_source.genie_space_id = '{genie_space_id}'
-     AND h2.start_time <= TIMESTAMP'{start_time}'
-     AND h2.end_time >= TIMESTAMP'{start_time}'
-     AND h2.statement_id != '{statement_id}'
+   FROM {QUERY_HISTORY_TABLE} h2 
+   WHERE h2.query_source.genie_space_id = '{{genie_space_id}}'
+     AND h2.start_time <= TIMESTAMP'{{start_time}}'
+     AND h2.end_time >= TIMESTAMP'{{start_time}}'
+     AND h2.statement_id != '{{statement_id}}'
   ) AS genie_concurrent,
   
   -- Warehouse concurrency: queries on same warehouse overlapping with this query  
   (SELECT COUNT(*) 
-   FROM system.query.history h2 
-   WHERE h2.compute.warehouse_id = '{warehouse_id}'
-     AND h2.start_time <= TIMESTAMP'{start_time}'
-     AND h2.end_time >= TIMESTAMP'{start_time}'
-     AND h2.statement_id != '{statement_id}'
+   FROM {QUERY_HISTORY_TABLE} h2 
+   WHERE h2.compute.warehouse_id = '{{warehouse_id}}'
+     AND h2.start_time <= TIMESTAMP'{{start_time}}'
+     AND h2.end_time >= TIMESTAMP'{{start_time}}'
+     AND h2.statement_id != '{{statement_id}}'
   ) AS warehouse_concurrent
 """
 
 
 # Batch query to compute concurrency for all queries in a space
 # Mirrors the prior per-query logic (point-in-time at query start) but batched
-BATCH_CONCURRENCY_QUERY = """
+BATCH_CONCURRENCY_QUERY = f"""
 WITH space_queries AS (
     SELECT 
         statement_id,
         start_time,
         COALESCE(end_time, current_timestamp()) AS end_time,
         compute.warehouse_id AS warehouse_id
-    FROM system.query.history
-    WHERE query_source.genie_space_id = '{space_id}'
-      AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+    FROM {QUERY_HISTORY_TABLE}
+    WHERE query_source.genie_space_id = '{{space_id}}'
+      AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
 ),
 warehouse_queries AS (
     SELECT 
@@ -621,8 +653,8 @@ warehouse_queries AS (
         start_time,
         COALESCE(end_time, current_timestamp()) AS end_time,
         compute.warehouse_id AS warehouse_id
-    FROM system.query.history
-    WHERE start_time >= current_timestamp() - INTERVAL {hours} HOUR
+    FROM {QUERY_HISTORY_TABLE}
+    WHERE start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
 )
 SELECT 
     q1.statement_id,
@@ -655,7 +687,7 @@ def get_batch_concurrency_query(space_id: str, hours: int = 720) -> str:
 # USER STATISTICS
 # ============================================================================
 
-USER_STATS_QUERY = """
+USER_STATS_QUERY = f"""
 SELECT
   executed_by AS user_name,
   COUNT(*) AS query_count,
@@ -664,10 +696,10 @@ SELECT
   SUM(CASE WHEN total_duration_ms >= 10000 THEN 1 ELSE 0 END) AS slow_queries,
   ROUND(SUM(COALESCE(read_bytes, 0)) / 1024.0 / 1024.0 / 1024.0, 2) AS total_gb_read,
   ROUND(100.0 * SUM(CASE WHEN execution_status = 'FINISHED' THEN 1 ELSE 0 END) / COUNT(*), 1) AS success_rate
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
-  {space_filter}
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
+  {{space_filter}}
 GROUP BY executed_by
 ORDER BY query_count DESC
 """
@@ -676,7 +708,7 @@ ORDER BY query_count DESC
 # IO HEAVY QUERIES
 # ============================================================================
 
-IO_HEAVY_QUERIES_QUERY = """
+IO_HEAVY_QUERIES_QUERY = f"""
 SELECT
   statement_id,
   query_source.genie_space_id AS genie_space_id,
@@ -699,20 +731,20 @@ SELECT
     WHEN COALESCE(read_files, 0) > 1000 THEN 'Many small files - run OPTIMIZE'
     ELSE 'OK'
   END AS io_recommendation
-FROM system.query.history
+FROM {QUERY_HISTORY_TABLE}
 WHERE query_source.genie_space_id IS NOT NULL
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
   AND COALESCE(read_bytes, 0) > 104857600
-  {space_filter}
+  {{space_filter}}
 ORDER BY read_bytes DESC
-LIMIT {limit}
+LIMIT {{limit}}
 """
 
 
 def build_space_filter(space_id: str | None) -> str:
     """Build SQL filter for a specific space."""
     if space_id:
-        return f"AND query_source.genie_space_id = '{space_id}'"
+        return f"AND query_source.genie_space_id = '{{space_id}}'"
     return ""
 
 
@@ -730,28 +762,28 @@ def build_status_filter(status: str | None) -> str:
 
 
 # ============================================================================
-# AI CONVERSATION ACTIVITY QUERIES (from system.access.audit)
+# AI CONVERSATION ACTIVITY QUERIES (from {AUDIT_TABLE})
 # ============================================================================
 
-CONVERSATION_ACTIVITY_QUERY = """
+CONVERSATION_ACTIVITY_QUERY = f"""
 SELECT
   COUNT(*) AS message_count,
   date_trunc('hour', event_time) AS event_hour
-FROM system.access.audit
+FROM {AUDIT_TABLE}
 WHERE service_name = 'aibiGenie'
-  AND event_date >= now() - INTERVAL {hours} HOUR
+  AND event_date >= now() - INTERVAL {{hours}} HOUR
   AND action_name IN (
     'genieCreateConversationMessage',
     'createConversationMessage',
     'genieStartConversationMessage',
     'regenerateConversationMessage'
   )
-  {space_filter}
+  {{space_filter}}
 GROUP BY event_hour
 ORDER BY event_hour
 """
 
-CONVERSATION_DAILY_QUERY = """
+CONVERSATION_DAILY_QUERY = f"""
 SELECT
   COUNT(*) AS message_count,
   DATE(event_time) AS event_date,
@@ -763,9 +795,9 @@ SELECT
     WHEN 'regenerateConversationMessage' THEN 'Regenerate Response'
     ELSE 'Other'
   END AS message_type
-FROM system.access.audit
+FROM {AUDIT_TABLE}
 WHERE service_name = 'aibiGenie'
-  AND DATE(event_time) >= DATE(now() - INTERVAL {hours} HOUR)
+  AND DATE(event_time) >= DATE(now() - INTERVAL {{hours}} HOUR)
   AND action_name IN (
     'genieCreateConversationMessage',
     'createConversationMessage',
@@ -773,19 +805,19 @@ WHERE service_name = 'aibiGenie'
     'genieContinueConversationMessage',
     'regenerateConversationMessage'
   )
-  {space_filter}
+  {{space_filter}}
 GROUP BY DATE(event_time), message_type
 ORDER BY event_date, message_type
 """
 
-CONVERSATION_PEAK_QUERY = """
+CONVERSATION_PEAK_QUERY = f"""
 WITH messages_per_minute AS (
   SELECT
     COUNT(*) AS message_count,
     date_trunc('minute', event_time) AS event_minute
-  FROM system.access.audit
+  FROM {AUDIT_TABLE}
   WHERE service_name = 'aibiGenie'
-    AND DATE(event_time) >= DATE(now() - INTERVAL {hours} HOUR)
+    AND DATE(event_time) >= DATE(now() - INTERVAL {{hours}} HOUR)
     AND action_name IN (
       'genieCreateConversationMessage',
       'createConversationMessage',
@@ -793,7 +825,7 @@ WITH messages_per_minute AS (
       'genieContinueConversationMessage',
       'regenerateConversationMessage'
     )
-    {space_filter}
+    {{space_filter}}
   GROUP BY event_minute
 )
 SELECT 
@@ -804,20 +836,20 @@ SELECT
 FROM messages_per_minute
 """
 
-CONVERSATION_BY_ACTION_QUERY = """
+CONVERSATION_BY_ACTION_QUERY = f"""
 SELECT
   action_name,
   COUNT(*) AS message_count
-FROM system.access.audit
+FROM {AUDIT_TABLE}
 WHERE service_name = 'aibiGenie'
-  AND event_date >= now() - INTERVAL {hours} HOUR
+  AND event_date >= now() - INTERVAL {{hours}} HOUR
   AND action_name IN (
     'genieCreateConversationMessage',
     'createConversationMessage',
     'genieStartConversationMessage',
     'regenerateConversationMessage'
   )
-  {space_filter}
+  {{space_filter}}
 GROUP BY action_name
 ORDER BY message_count DESC
 """
@@ -827,29 +859,29 @@ def build_audit_space_filter(space_id: str | None) -> str:
     """Build SQL filter for space ID in audit logs."""
     if not space_id:
         return ""
-    return f"AND request_params.space_id = '{space_id}'"
+    return f"AND request_params.space_id = '{{space_id}}'"
 
 
 # AI Latency estimation queries - correlate message events with query execution
-AI_LATENCY_METRICS_QUERY = """
+AI_LATENCY_METRICS_QUERY = f"""
 WITH message_events AS (
   SELECT 
     event_time as message_time,
     request_params.space_id as space_id
-  FROM system.access.audit
+  FROM {AUDIT_TABLE}
   WHERE service_name = 'aibiGenie'
-    AND event_date >= now() - INTERVAL {hours} HOUR
+    AND event_date >= now() - INTERVAL {{hours}} HOUR
     AND action_name IN ('genieStartConversationMessage', 'createConversationMessage')
-    {space_filter}
+    {{space_filter}}
 ),
 queries AS (
   SELECT 
     query_source.genie_space_id as space_id,
     start_time as query_start
-  FROM system.query.history
+  FROM {QUERY_HISTORY_TABLE}
   WHERE query_source.genie_space_id IS NOT NULL
-    AND start_time >= now() - INTERVAL {hours} HOUR
-    {query_space_filter}
+    AND start_time >= now() - INTERVAL {{hours}} HOUR
+    {{query_space_filter}}
 )
 SELECT 
   COUNT(*) as message_query_pairs,
@@ -864,26 +896,26 @@ JOIN queries q ON m.space_id = q.space_id
 """
 
 
-AI_LATENCY_TREND_QUERY = """
+AI_LATENCY_TREND_QUERY = f"""
 WITH message_events AS (
   SELECT 
     event_time as message_time,
     DATE(event_time) as event_date,
     request_params.space_id as space_id
-  FROM system.access.audit
+  FROM {AUDIT_TABLE}
   WHERE service_name = 'aibiGenie'
-    AND event_date >= now() - INTERVAL {hours} HOUR
+    AND event_date >= now() - INTERVAL {{hours}} HOUR
     AND action_name IN ('genieStartConversationMessage', 'createConversationMessage')
-    {space_filter}
+    {{space_filter}}
 ),
 queries AS (
   SELECT 
     query_source.genie_space_id as space_id,
     start_time as query_start
-  FROM system.query.history
+  FROM {QUERY_HISTORY_TABLE}
   WHERE query_source.genie_space_id IS NOT NULL
-    AND start_time >= now() - INTERVAL {hours} HOUR
-    {query_space_filter}
+    AND start_time >= now() - INTERVAL {{hours}} HOUR
+    {{query_space_filter}}
 )
 SELECT 
   m.event_date,
@@ -903,14 +935,14 @@ def build_query_space_filter(space_id: str | None) -> str:
     """Build SQL filter for space ID in query history."""
     if not space_id:
         return ""
-    return f"AND query_source.genie_space_id = '{space_id}'"
+    return f"AND query_source.genie_space_id = '{{space_id}}'"
 
 
 # ============================================================================
 # BATCH QUERY BY STATEMENT IDS - For conversation-first data fetching
 # ============================================================================
 
-QUERIES_BY_STATEMENT_IDS = """
+QUERIES_BY_STATEMENT_IDS = f"""
 SELECT
     statement_id,
     query_source.genie_space_id AS genie_space_id,
@@ -943,8 +975,8 @@ SELECT
       WHEN total_duration_ms >= 5000 THEN 'MODERATE'
       ELSE 'FAST'
     END AS speed_category
-FROM system.query.history
-WHERE statement_id IN ({statement_ids})
+FROM {QUERY_HISTORY_TABLE}
+WHERE statement_id IN ({{statement_ids}})
 """
 
 
@@ -960,7 +992,7 @@ def build_statement_ids_filter(statement_ids: list[str]) -> str:
 # QUERIES BY SPACE WITH TIMING - For time-based message correlation
 # ============================================================================
 
-QUERIES_BY_SPACE_AND_TIME = """
+QUERIES_BY_SPACE_AND_TIME = f"""
 SELECT
     statement_id,
     query_source.genie_space_id AS genie_space_id,
@@ -994,9 +1026,9 @@ SELECT
       WHEN total_duration_ms >= 5000 THEN 'MODERATE'
       ELSE 'FAST'
     END AS speed_category
-FROM system.query.history
-WHERE query_source.genie_space_id = '{space_id}'
-  AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+FROM {QUERY_HISTORY_TABLE}
+WHERE query_source.genie_space_id = '{{space_id}}'
+  AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
 ORDER BY start_time ASC
 """
 
@@ -1007,10 +1039,56 @@ def get_queries_by_space_and_time(space_id: str, hours: int = 720) -> str:
 
 
 # ============================================================================
+# CONVERSATIONS FROM AUDIT LOGS - Fallback when Genie API is unavailable
+# ============================================================================
+
+CONVERSATIONS_FROM_AUDIT_QUERY = f"""
+WITH conversation_events AS (
+    SELECT
+        request_params.conversation_id AS conversation_id,
+        request_params.content AS content,
+        user_identity.email AS user_email,
+        event_time,
+        action_name,
+        ROW_NUMBER() OVER (PARTITION BY request_params.conversation_id ORDER BY event_time ASC) AS rn
+    FROM {AUDIT_TABLE}
+    WHERE service_name = 'aibiGenie'
+      AND action_name IN (
+          'genieStartConversationMessage',
+          'genieCreateConversationMessage', 
+          'createConversationMessage',
+          'createConversation'
+      )
+      AND request_params.space_id = '{{space_id}}'
+      AND event_date >= current_timestamp() - INTERVAL {{hours}} HOUR
+      AND request_params.conversation_id IS NOT NULL
+)
+SELECT
+    conversation_id,
+    content AS title,
+    user_email,
+    event_time AS created_time
+FROM conversation_events
+WHERE rn = 1
+ORDER BY created_time DESC
+LIMIT {{max_conversations}}
+"""
+
+
+def get_conversations_from_audit_query(space_id: str, hours: int = 720, max_conversations: int = 50) -> str:
+    """Build query to list conversations from audit logs (fallback when API fails)."""
+    return CONVERSATIONS_FROM_AUDIT_QUERY.format(
+        space_id=space_id, 
+        hours=hours, 
+        max_conversations=max_conversations
+    )
+
+
+# ============================================================================
 # CONVERSATION SOURCE LOOKUP - From audit logs (aibiGenie events)
 # ============================================================================
 
-CONVERSATION_SOURCE_QUERY = """
+CONVERSATION_SOURCE_QUERY = f"""
 SELECT
     request_params.conversation_id AS conversation_id,
     action_name,
@@ -1021,7 +1099,7 @@ SELECT
         WHEN action_name IN ('createConversationMessage', 'createConversation') THEN 'Space'
         ELSE 'Unknown'
     END AS message_source
-FROM system.access.audit
+FROM {AUDIT_TABLE}
 WHERE service_name = 'aibiGenie'
   AND action_name IN (
       'genieStartConversationMessage',
@@ -1029,8 +1107,8 @@ WHERE service_name = 'aibiGenie'
       'createConversationMessage',
       'createConversation'
   )
-  AND request_params.space_id = '{space_id}'
-  AND event_date >= current_timestamp() - INTERVAL {hours} HOUR
+  AND request_params.space_id = '{{space_id}}'
+  AND event_date >= current_timestamp() - INTERVAL {{hours}} HOUR
 ORDER BY event_time ASC
 """
 
@@ -1041,10 +1119,89 @@ def get_conversation_sources_query(space_id: str, hours: int = 720) -> str:
 
 
 # ============================================================================
+# MESSAGES FROM AUDIT LOGS - Fallback when Genie API is unavailable
+# ============================================================================
+
+MESSAGES_FROM_AUDIT_QUERY = f"""
+SELECT
+    request_params.message_id AS message_id,
+    request_params.conversation_id AS conversation_id,
+    request_params.content AS content,
+    user_identity.email AS user_email,
+    event_time AS message_time,
+    action_name,
+    CASE
+        WHEN action_name IN ('genieCreateConversationMessage', 'genieStartConversationMessage') THEN 'API'
+        WHEN action_name IN ('createConversationMessage', 'regenerateConversationMessage') THEN 'Space'
+        ELSE 'Unknown'
+    END AS message_source
+FROM {AUDIT_TABLE}
+WHERE service_name = 'aibiGenie'
+  AND action_name IN (
+      'genieStartConversationMessage',
+      'genieCreateConversationMessage', 
+      'createConversationMessage',
+      'regenerateConversationMessage'
+  )
+  AND request_params.space_id = '{{space_id}}'
+  AND request_params.conversation_id = '{{conversation_id}}'
+  AND event_date >= current_timestamp() - INTERVAL {{hours}} HOUR
+  AND request_params.message_id IS NOT NULL
+ORDER BY event_time ASC
+"""
+
+
+def get_messages_from_audit_query(space_id: str, conversation_id: str, hours: int = 720) -> str:
+    """Build query to get messages for a conversation from audit logs (fallback when API fails)."""
+    return MESSAGES_FROM_AUDIT_QUERY.format(
+        space_id=space_id,
+        conversation_id=conversation_id,
+        hours=hours
+    )
+
+
+# ============================================================================
+# BATCH MESSAGES FROM AUDIT LOGS - Get all messages for a space at once
+# ============================================================================
+
+BATCH_MESSAGES_FROM_AUDIT_QUERY = f"""
+SELECT
+    request_params.message_id AS message_id,
+    request_params.conversation_id AS conversation_id,
+    request_params.content AS content,
+    user_identity.email AS user_email,
+    event_time AS message_time,
+    action_name,
+    CASE
+        WHEN action_name IN ('genieCreateConversationMessage', 'genieStartConversationMessage') THEN 'API'
+        WHEN action_name IN ('createConversationMessage', 'regenerateConversationMessage') THEN 'Space'
+        ELSE 'Unknown'
+    END AS message_source
+FROM {AUDIT_TABLE}
+WHERE service_name = 'aibiGenie'
+  AND action_name IN (
+      'genieStartConversationMessage',
+      'genieCreateConversationMessage', 
+      'createConversationMessage',
+      'regenerateConversationMessage'
+  )
+  AND request_params.space_id = '{{space_id}}'
+  AND event_date >= current_timestamp() - INTERVAL {{hours}} HOUR
+  AND request_params.message_id IS NOT NULL
+ORDER BY conversation_id, event_time ASC
+"""
+
+
+def get_batch_messages_from_audit_query(space_id: str, hours: int = 720) -> str:
+    """Build query to get ALL messages for a space from audit logs (for fallback batch loading)."""
+    return BATCH_MESSAGES_FROM_AUDIT_QUERY.format(space_id=space_id, hours=hours)
+
+
+# ============================================================================
 # MESSAGE AI OVERHEAD - Time from message submission to first SQL query
 # ============================================================================
 
-MESSAGE_AI_OVERHEAD_QUERY = """
+MESSAGE_AI_OVERHEAD_QUERY = f"""
 WITH message_events AS (
     SELECT 
         request_params.conversation_id AS conversation_id,
@@ -1058,7 +1215,7 @@ WITH message_events AS (
             WHEN action_name IN ('createConversationMessage', 'regenerateConversationMessage') THEN 'Space'
             ELSE 'Unknown'
         END AS message_source
-    FROM system.access.audit
+    FROM {AUDIT_TABLE}
     WHERE service_name = 'aibiGenie'
       AND action_name IN (
           'genieStartConversationMessage',
@@ -1066,8 +1223,8 @@ WITH message_events AS (
           'createConversationMessage',
           'regenerateConversationMessage'
       )
-      AND request_params.space_id = '{space_id}'
-      AND event_date >= current_timestamp() - INTERVAL {hours} HOUR
+      AND request_params.space_id = '{{space_id}}'
+      AND event_date >= current_timestamp() - INTERVAL {{hours}} HOUR
 ),
 queries AS (
     SELECT 
@@ -1076,9 +1233,9 @@ queries AS (
         start_time AS query_start,
         total_duration_ms,
         executed_by
-    FROM system.query.history
-    WHERE query_source.genie_space_id = '{space_id}'
-      AND start_time >= current_timestamp() - INTERVAL {hours} HOUR
+    FROM {QUERY_HISTORY_TABLE}
+    WHERE query_source.genie_space_id = '{{space_id}}'
+      AND start_time >= current_timestamp() - INTERVAL {{hours}} HOUR
 ),
 message_with_first_query AS (
     SELECT 

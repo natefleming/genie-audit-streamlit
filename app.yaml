@@ -17,3 +17,5 @@ env:
     value: 148ccb90800933a1
   - name: STREAMLIT_THEME_BASE
     value: dark
+  - name: SYSTEM_CATALOG
+    value: system
